@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::{
     dirs, env,
-    file::display_path,
+    file::{self, display_path},
     git::{self, CloneOptions},
     hash,
     lock_file::LockFile,
@@ -68,6 +68,10 @@ impl GitRepoStructure {
 }
 
 impl RemoteTaskGit {
+    fn prepare_task_file(path: &PathBuf) -> Result<()> {
+        file::make_executable(path)
+    }
+
     fn get_cache_key(&self, repo_structure: &GitRepoStructure) -> String {
         let key = format!(
             "{}{}",
@@ -128,6 +132,7 @@ impl TaskFileProvider for RemoteTaskGit {
             trace!("Cache mode enabled");
             if full_path.exists() {
                 debug!("Using cached file: {:?}", full_path);
+                Self::prepare_task_file(&full_path)?;
                 return Ok(full_path);
             }
         } else {
@@ -170,6 +175,7 @@ impl TaskFileProvider for RemoteTaskGit {
             }
         }
 
+        Self::prepare_task_file(&full_path)?;
         Ok(full_path)
     }
 }
@@ -178,6 +184,22 @@ impl TaskFileProvider for RemoteTaskGit {
 mod tests {
 
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn test_prepare_task_file_makes_non_executable_file_executable() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let task_file = temp_dir.path().join("task");
+        fs::write(&task_file, "#!/usr/bin/env bash\necho ok\n").unwrap();
+        fs::set_permissions(&task_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        RemoteTaskGit::prepare_task_file(&task_file).unwrap();
+
+        assert!(file::is_executable(&task_file));
+    }
 
     #[test]
     fn test_valid_parse_ssh() {
