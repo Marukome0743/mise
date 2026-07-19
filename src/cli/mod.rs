@@ -854,6 +854,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_config_target_file_and_path_aliases() {
+        let cases: &[(&[&str], &str, &str)] = &[
+            (&["use"], "path", "file"),
+            (&["unuse"], "path", "file"),
+            (&["set"], "file", "path"),
+            (&["unset"], "file", "path"),
+            (&["config", "get"], "file", "path"),
+            (&["config", "set"], "file", "path"),
+            (&["bootstrap", "packages", "use"], "path", "file"),
+            (&["bootstrap", "packages", "import"], "path", "file"),
+            (&["bootstrap", "packages", "brew", "tap"], "path", "file"),
+            (&["bootstrap", "packages", "brew", "untap"], "path", "file"),
+            (&["dotfiles", "add"], "path", "file"),
+        ];
+        let root = Cli::command();
+
+        for (path, arg_name, alias) in cases {
+            let command = path.iter().fold(&root, |command, name| {
+                command
+                    .get_subcommands()
+                    .find(|subcommand| subcommand.get_name() == *name)
+                    .unwrap_or_else(|| panic!("missing command path {}", path.join(" ")))
+            });
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == *arg_name)
+                .unwrap_or_else(|| panic!("missing --{arg_name} on {}", path.join(" ")));
+
+            assert!(
+                arg.get_visible_aliases()
+                    .is_some_and(|aliases| aliases.contains(alias)),
+                "missing visible --{alias} alias for --{arg_name} on {}",
+                path.join(" ")
+            );
+        }
+    }
+
+    #[test]
     fn test_subcommands_are_sorted() {
         let cmd = Cli::command();
         // Check all subcommands except watch (which has many watchexec passthrough args)
