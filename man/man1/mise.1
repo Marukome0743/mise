@@ -2230,6 +2230,28 @@ Comma\-separated list of platforms to target
 e.g.: linux\-x64,macos\-arm64,windows\-x64
 If not specified, all platforms already in lockfile will be updated
 .TP
+\fB\-\-bump\fR
+Re\-resolve fuzzy version selectors against the latest available versions
+
+By default, `mise lock` refreshes metadata for the currently locked versions.
+With this flag, selectors like "latest", "lts", or prefixes like "20" are
+re\-resolved against the latest matching remote versions, so the lockfile
+advances without installing anything. Config files are never modified:
+exactly pinned versions resolve to themselves and stay unchanged
+(use `mise upgrade \-\-bump` to rewrite pins in mise.toml).
+.TP
+\fB\-\-json\fR
+Output version changes as JSON
+
+Prints an array of objects describing lockfile version changes:
+name, backend, lockfile, old_versions, new_versions.
+Version lists keep config/lockfile order; they are not sorted.
+Only version\-level changes are reported: checksum/URL refreshes for
+unchanged versions produce no entries, so plain `mise lock \-\-json`
+typically prints `[]` while still updating the lockfile.
+Suppresses the human\-readable output. Combine with `\-\-dry\-run` to
+detect available updates without writing the lockfile.
+.TP
 \fB\-\-local\fR
 Update mise.local.lock instead of mise.lock
 Use for tools defined in .local.toml configs
@@ -2405,12 +2427,16 @@ Overrides [oci].user_id / [oci].group_id. Defaults to 0:0. If GID is omitted, it
 .SH "MISE OCI PUSH"
 [experimental] Build an OCI image and push it to a registry
 
-Requires `skopeo` (or `crane`) on PATH. If `\-\-image\-dir` is not passed,
-builds fresh from the current mise.toml first, then shells out to
-`skopeo copy oci:<dir> docker://<ref>` (or `crane push <dir> <ref>`).
-Authentication is handled by the underlying tool — configure it the same
-way you would for a plain `skopeo` / `crane` push (e.g. `docker login`,
-`REGISTRY_AUTH_FILE`, `~/.config/containers/auth.json`).
+Pushes with mise's built\-in registry client — no skopeo/crane/docker
+required. If `\-\-image\-dir` is not passed, builds fresh from the current
+mise.toml first. Only blobs the registry doesn't already have are
+uploaded, so repeat pushes of mostly\-unchanged toolsets are cheap.
+
+Credentials are read from the same places docker and podman use:
+`$REGISTRY_AUTH_FILE`, `$XDG_RUNTIME_DIR/containers/auth.json`,
+`~/.config/containers/auth.json`, and `~/.docker/config.json`
+(including credential helpers) — so `docker login` / `podman login`
+is all the setup needed.
 
 Requires `mise settings experimental=true` (or `MISE_EXPERIMENTAL=1`).
 .PP
@@ -2440,12 +2466,6 @@ Don't embed the mise binary (ignored with \-\-image\-dir)
 UID[:GID] to assign to every tar entry when building (conflicts with \-\-image\-dir)
 
 Overrides [oci].user_id / [oci].group_id. Defaults to 0:0. If GID is omitted, it defaults to UID. This affects file ownership only; [oci].user controls the image USER directive.
-.TP
-\fB\-\-tool\fR \fI<TOOL>\fR
-Force the push tool (`auto`, `skopeo`, `crane`). Default `auto`
-.RS
-\fIDefault: \fRauto
-.RE
 \fBArguments:\fR
 .PP
 .TP
@@ -2455,12 +2475,12 @@ Destination registry reference (e.g. `ghcr.io/me/devenv:latest`)
 [experimental] Build an OCI image from the current mise.toml and run a command in it
 
 Equivalent to `mise oci build` followed by `docker run` / `podman run`.
-The built image is loaded into the local container engine (podman is
-preferred; docker works via skopeo) and the given command is executed
-inside it with stdin/stdout/stderr inherited.
+The built image is loaded into the local container engine (podman pulls
+the OCI layout natively; docker receives it via `docker load`) and the
+given command is executed inside it with stdin/stdout/stderr inherited.
 
 Requires `mise settings experimental=true` (or `MISE_EXPERIMENTAL=1`) and
-one of: `podman`, `docker+skopeo`.
+one of: `podman`, `docker`.
 .PP
 \fBUsage:\fR mise oci run [OPTIONS] [<CMD>] ...
 .PP

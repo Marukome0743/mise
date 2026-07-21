@@ -163,22 +163,6 @@ impl Client {
         Ok(resp.bytes().await?)
     }
 
-    /// Like `get_bytes`, but lets the caller supply the exact headers used
-    /// for the request. Does NOT merge `host_auth_headers` — this mirrors
-    /// `json_headers_with_headers` so callers get consistent behavior
-    /// between manifest JSON fetches and blob byte fetches to the same host
-    /// (e.g. `ghcr.io`, where the OCI Bearer token must not be mixed with
-    /// the GitHub token that host_auth_headers would inject).
-    pub async fn get_bytes_with_headers<U: IntoUrl>(
-        &self,
-        url: U,
-        headers: &HeaderMap,
-    ) -> Result<impl AsRef<[u8]>> {
-        let url = url.into_url().unwrap();
-        let resp = self.get_async_with_headers(url, headers).await?;
-        Ok(resp.bytes().await?)
-    }
-
     pub async fn get_async<U: IntoUrl>(&self, url: U) -> Result<Response> {
         let url = url.into_url()?;
         let headers = host_auth_headers(&url)?;
@@ -1120,7 +1104,7 @@ fn display_github_rate_limit(resp: &Response) {
     }
 }
 
-fn default_backoff_strategy(retries: i64) -> impl Iterator<Item = Duration> {
+pub(crate) fn default_backoff_strategy(retries: i64) -> impl Iterator<Item = Duration> {
     // Hand-rolled schedule (with jitter): ~200ms / ~1s / ~4s / ~15s, then 15s
     // for every retry beyond the schedule. The trailing repeat matters because
     // `MISE_HTTP_RETRIES` can be set arbitrarily high — a fixed-length array

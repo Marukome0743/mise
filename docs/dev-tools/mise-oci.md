@@ -30,7 +30,7 @@ Flags, output layout, and defaults may change in future releases.
 | ---------------- | ------------------------------------------------------------------------ |
 | `mise oci build` | Produce an OCI image layout on disk.                                     |
 | `mise oci run`   | Build (or reuse) an image and run a command inside it via podman/docker. |
-| `mise oci push`  | Build (or reuse) an image and push it to a registry via skopeo or crane. |
+| `mise oci push`  | Build (or reuse) an image and push it to a registry.                     |
 
 ## Quick start
 
@@ -40,15 +40,14 @@ Flags, output layout, and defaults may change in future releases.
 mise oci build
 
 # Run an interactive shell in the image (uses podman if present, else
-# docker + skopeo).
+# docker).
 mise oci run -it -- bash
 
-# Push to a registry (shells out to skopeo; falls back to crane).
+# Push to a registry with the built-in client (no skopeo/crane needed).
 mise oci push ghcr.io/me/devenv:latest
 
-# You can also go through skopeo/crane manually:
+# The output is a standard OCI image layout, so external tools work too:
 skopeo inspect oci:./mise-oci
-skopeo copy oci:./mise-oci docker://ghcr.io/me/devenv:latest
 ```
 
 ## How layering works
@@ -144,25 +143,38 @@ mise oci run --image-dir ./img -- node --version
 ```
 
 **Requirements:** either `podman` (native OCI-layout support) or
-`docker + skopeo` (skopeo loads the layout into the docker daemon).
+`docker` (mise streams the image into the daemon via `docker load`).
 
 ## `mise oci push`
 
-Build (or reuse) an image and push it to a registry via `skopeo` or
-`crane`. mise never handles credentials itself — configure the
-underlying tool (`docker login`, `REGISTRY_AUTH_FILE`, `crane auth
-login`, etc.).
+Build (or reuse) an image and push it to a registry with mise's
+built-in registry client — no skopeo, crane, or docker daemon
+required. Only blobs the registry doesn't already have are uploaded,
+so repeat pushes of a mostly-unchanged toolset transfer very little.
+When the base image lives on the destination registry, its blobs are
+cross-repository mounted instead of re-uploaded (no bytes transferred).
+Large layers upload in chunks with progress bars, and transient network
+failures are retried with backoff (`http_retries` controls attempts).
 
 ```sh
-mise oci push [--tool TOOL] [--image-dir DIR]
+mise oci push [--image-dir DIR]
               [--from REF] [--mount-point PATH] [--no-mise]
               [--owner UID[:GID]]
               <REGISTRY_REF>
 ```
 
 - `<REGISTRY_REF>` — fully-qualified destination (e.g.
-  `ghcr.io/me/devenv:latest`). Must include a registry host.
-- `--tool` — `auto` (default, prefers skopeo), `skopeo`, or `crane`.
+  `ghcr.io/me/devenv:latest`). Must include a registry host. Loopback
+  registries (`localhost:5000/…`) are contacted over plain HTTP, the
+  same insecure-by-default convention docker applies. Non-loopback
+  plain-HTTP registries (a homelab `registry.lan:5000`) must be opted
+  in via the `oci.insecure_registries` setting:
+
+  ```toml
+  [settings.oci]
+  insecure_registries = ["registry.lan:5000"]
+  ```
+
 - `--image-dir` — push an existing OCI layout instead of building.
 
 - `--owner UID[:GID]` — numeric owner for generated layer entries when
@@ -178,6 +190,25 @@ mise oci push ghcr.io/me/devenv:latest
 mise oci build -o ./img
 mise oci push --image-dir ./img ghcr.io/me/devenv:v1
 ```
+
+### Push authentication
+
+Credentials are resolved from the same sources docker and podman use,
+in this order:
+
+1. `$REGISTRY_AUTH_FILE`
+2. `$XDG_RUNTIME_DIR/containers/auth.json` (podman)
+3. `~/.config/containers/auth.json`
+4. `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`)
+
+Both inline `auths` entries and credential helpers
+(`credsStore` / `credHelpers`, e.g. `docker-credential-osxkeychain`,
+`docker-credential-ecr-login`) are supported — so a plain
+`docker login ghcr.io` or `podman login ghcr.io` is all the setup
+needed. When no credentials are found, mise pushes anonymously (useful
+for local registries) and warns.
+
+For ghcr.io, the token needs the `write:packages` scope.
 
 ### `[oci]` section in `mise.toml`
 
@@ -317,16 +348,11 @@ out with a clear message.
 
 ## Registry base-image support
 
-v1 can pull base images from any OCI Distribution v2 registry that
-accepts anonymous pulls:
-
-- Docker Hub (`debian`, `ubuntu`, `node`, …) — token auth handled
-  anonymously.
-- GitHub Container Registry (`ghcr.io/…`) — public images only.
-- Quay.io (`quay.io/…`) — public images only.
-- Self-hosted / other registries — work if no auth is required.
-
-Authenticated pulls (private base images) are a follow-up.
+Base images can be pulled from any OCI Distribution v2 registry —
+Docker Hub, ghcr.io, quay.io, self-hosted, etc. Anonymous token auth
+is handled automatically for public images; when you're logged in
+(`docker login` / `podman login`), those credentials are used, so
+private base images work too.
 
 Digest references are supported:
 
@@ -362,18 +388,14 @@ works). mise prints a warning when this mismatch is detected.
 ## Known limitations (v1)
 
 - `asdf` / `vfox` backends are rejected (see above).
-- Only anonymous registry pulls for `--from`; no auth yet.
-  (`mise oci push` does handle auth — it just delegates to skopeo/crane
-  which already do.)
 - Cross-platform builds produce broken images (binaries are host-native);
   run the build on a linux host.
 - Alpine / musl base images will break most tools.
-- `mise oci run` / `oci push` shell out to external tools
-  (podman, docker+skopeo, crane). No built-in container runtime or
-  registry client.
+- `mise oci run` needs a container engine (podman or docker) — mise has
+  no built-in container runtime. Pushing needs no external tools.
 
 ## See also
 
 - [`mise oci build`](/cli/oci/build.md) — full CLI reference
 - [OCI Image Spec](https://github.com/opencontainers/image-spec)
-- [skopeo](https://github.com/containers/skopeo) for pushing images
+- [OCI Distribution Spec](https://github.com/opencontainers/distribution-spec)

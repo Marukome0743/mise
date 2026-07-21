@@ -117,8 +117,12 @@ env = { _.file = '/path/to/file.env', "MY_VAR" = "my variable" }
 ## Lazy eval
 
 Environment variables typically are resolved before tools—that way you can configure tool installation
-with environment variables. However, sometimes you want to access environment variables produced by
-tools. To do that, turn the value into a map with `tools = true`:
+subprocesses with environment variables. This does not apply to variables that configure mise itself,
+such as `MISE_DATA_DIR` or `MISE_INSTALLS_DIR`. These variables are read when the process starts, so
+set them in the shell or CI environment before invoking mise rather than in `[env]`.
+
+Sometimes you want to access environment variables produced by tools. To do that, turn the value into
+a map with `tools = true`:
 
 ```toml
 [env]
@@ -454,6 +458,15 @@ The shebang will be **ignored**. See [#1448](https://github.com/jdx/mise/discuss
 for a potential alternative that would work with binaries or other script languages.
 :::
 
+::: info Windows
+On Windows, sourcing requires a real POSIX bash such as [Git for Windows](https://gitforwindows.org/)
+or MSYS2. mise auto-detects it the same way it does for bash tasks (common install
+locations are probed even when bash is not on `PATH`; set `MISE_BASH_PATH` to point at a
+specific bash; the WSL launcher at `C:\Windows\System32\bash.exe` is never auto-selected
+since WSL cannot read Windows script paths). `PATH` entries the script prepends (in
+`/c/...` or `/cygdrive/c/...` form) are converted back to Windows form.
+:::
+
 The `env._.source` directive supports:
 
 - A single source as a string or an object
@@ -551,25 +564,13 @@ For a working example, see the [mise-env-plugin-template](https://github.com/jdx
 
 ## Multiple `env._` Directives
 
-It may be necessary to use multiple `env._` directives, however TOML fails with this syntax
-because it has 2 identical keys in a table:
+Some directives accept an array when you need to apply them more than once. For example,
+multiple scripts can be sourced in order with a single `_.source` key:
 
 ```toml
 [env]
-_.source = "./script_1.sh"
-_.source = "./script_2.sh" # invalid // [!code error]
+_.source = ["./script_1.sh", "./script_2.sh"]
 ```
-
-For this use-case, you can optionally make `[env]` an array-of-tables instead by using `[[env]]` instead:
-
-```toml
-[[env]]
-_.source = "./script_1.sh"
-[[env]]
-_.source = "./script_2.sh"
-```
-
-It works identically but you can have multiple tables.
 
 ## Templates
 

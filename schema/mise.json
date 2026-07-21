@@ -1323,6 +1323,11 @@
               "description": "Package manager to use for installing npm packages.",
               "type": "string",
               "enum": ["auto", "npm", "aube", "bun", "pnpm"]
+            },
+            "use_npm_view": {
+              "default": false,
+              "description": "Use the npm CLI (`npm view`) for version metadata queries instead of mise's built-in registry client.",
+              "type": "boolean"
             }
           }
         },
@@ -1339,6 +1344,13 @@
               "default": "/mise",
               "description": "Path inside OCI images where mise tools are installed.",
               "type": "string"
+            },
+            "insecure_registries": {
+              "description": "Registries (host or host:port) contacted over plain HTTP instead of HTTPS.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           }
         },
@@ -2339,11 +2351,36 @@
           "description": "version of the tool to install",
           "type": "string"
         },
+        "path": {
+          "description": "path to a custom compiled version",
+          "type": "string"
+        },
+        "prefix": {
+          "description": "version prefix to resolve",
+          "type": "string"
+        },
+        "ref": {
+          "description": "version control reference to compile",
+          "type": "string"
+        },
         "os": {
           "$ref": "#/$defs/os_filter"
         }
       },
-      "required": ["version"],
+      "oneOf": [
+        {
+          "required": ["version"]
+        },
+        {
+          "required": ["path"]
+        },
+        {
+          "required": ["prefix"]
+        },
+        {
+          "required": ["ref"]
+        }
+      ],
       "type": "object"
     },
     "hook_run_string": {

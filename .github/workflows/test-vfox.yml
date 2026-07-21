@@ -24,7 +24,7 @@ jobs:
     runs-on: namespace-profile-endev-linux-amd64;overrides.cache-tag=mise-pr-rust-linux
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: namespacelabs/nscloud-cache-action@58bf6e08898e88803c098e2b522668541cd3b2e3 # v1
+      - uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547 # v1
         with:
           path: |
             ~/.cargo/registry
@@ -48,14 +48,6 @@ jobs:
           cargo build --all-features
           echo "$PWD/target/debug" >> "$GITHUB_PATH"
       - run: mise -v
-      - run: mise --cd crates/vfox install
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6 # zizmor: ignore[cache-poisoning] cache key is scoped by mise.toml hash; tool installs only
-        with:
-          key: ${{ runner.os }}-${{ runner.arch }}-mise-tools-vfox-${{ hashFiles('crates/vfox/mise.toml') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-mise-tools-vfox-
-          path: |
-            ~/.local/share/mise
-            ~/.cache/mise
       - run: mise --cd crates/vfox run build
       - run: mise --cd crates/vfox run lint
       - run: mise --cd crates/vfox run test

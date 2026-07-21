@@ -1,8 +1,8 @@
-{ pkgs, lib, fetchFromGitHub, rustPlatform, coreutils, bash, direnv, openssl, git }:
+{ pkgs, lib, rustPlatform, coreutils, bash, direnv, openssl, git }:
 
 rustPlatform.buildRustPackage {
   pname = "mise";
-  version = "2026.7.10";
+  version = "2026.7.11";
 
   src = lib.cleanSource ./.;
 
