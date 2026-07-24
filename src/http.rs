@@ -750,6 +750,25 @@ impl Client {
                 }
             }
         }
+        if options.error_for_status && is_github_unauthorized(&url, &resp) {
+            // A static invalid/expired token (env var, gh CLI, ...) produces a 401
+            // that the OAuth-refresh path above cannot recover. Surface a clear
+            // error naming the token source instead of a bare status error. See #7218.
+            let status_error = resp
+                .error_for_status_ref()
+                .expect_err("401 response should be an error");
+            let used_github_token = final_headers.contains_key(AUTHORIZATION);
+            let env_var = original_url
+                .host_str()
+                .and_then(crate::github::auth_env_var_for_host);
+            let body = resp.text().await.unwrap_or_default();
+            return Err(github_unauthorized_report(
+                status_error,
+                used_github_token,
+                env_var,
+                &body,
+            ));
+        }
         if options.error_for_status && is_github_forbidden(&url, &resp) {
             let status = resp.status();
             let status_error = resp
@@ -846,6 +865,41 @@ impl TextRequest<'_> {
 
 fn is_github_forbidden(url: &Url, resp: &Response) -> bool {
     resp.status() == StatusCode::FORBIDDEN && url.host_str() == Some("api.github.com")
+}
+
+fn is_github_unauthorized(url: &Url, resp: &Response) -> bool {
+    resp.status() == StatusCode::UNAUTHORIZED && crate::github::is_github_api_url(url)
+}
+
+fn github_unauthorized_report(
+    status_error: reqwest::Error,
+    used_github_token: bool,
+    env_var: Option<&str>,
+    body: &str,
+) -> Report {
+    // Only report a token when one was actually sent: the process may have a
+    // GitHub token env var set that wasn't applied to this request.
+    let auth = if !used_github_token {
+        "no".to_string()
+    } else {
+        env_var
+            .map(|var| format!("yes (token from {var})"))
+            .unwrap_or_else(|| "yes".to_string())
+    };
+    let body = format_response_body(body);
+    let hint = if used_github_token {
+        let source = env_var
+            .map(|var| format!("token in `{var}`"))
+            .unwrap_or_else(|| "configured GitHub token".to_string());
+        format!(
+            "\nhint: the {source} was rejected by GitHub (401 Unauthorized). Verify it is a \
+             valid, non-expired token for this host with the required scopes — see \
+             https://mise.jdx.dev/dev-tools/github-tokens.html"
+        )
+    } else {
+        String::new()
+    };
+    eyre!("{status_error}\ngithub auth: {auth}\ngithub response: {body}{hint}")
 }
 
 fn github_forbidden_report(
@@ -1682,6 +1736,80 @@ refresh_expires_at = "2099-01-01T00:00:00Z"
         assert!(msg.contains("github auth: yes"));
         assert!(msg.contains("github rate limit: 42/5000 (core), resets at 1781337353"));
         assert!(msg.contains(r#"{"message":"secondary rate limit","docs":"url"}"#));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_github_unauthorized_report_names_token_source() {
+        // env var known → the message names it and includes the token-guide hint.
+        let (port, _count) = spawn_canned_server(vec![unauthorized_response()]).await;
+        let url = format!("http://127.0.0.1:{port}/repos/owner/repo/releases");
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        let status_error = resp
+            .error_for_status_ref()
+            .expect_err("401 response should be an error");
+        let body = resp.text().await.unwrap();
+        let err = github_unauthorized_report(status_error, true, Some("GITHUB_TOKEN"), &body);
+        let msg = format!("{err:?}");
+
+        assert!(
+            msg.contains("github auth: yes (token from GITHUB_TOKEN)"),
+            "{msg}"
+        );
+        assert!(msg.contains("Bad credentials"), "{msg}");
+        assert!(
+            msg.contains("token in `GITHUB_TOKEN` was rejected by GitHub (401 Unauthorized)"),
+            "{msg}"
+        );
+        assert!(msg.contains("github-tokens.html"), "{msg}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_github_unauthorized_report_without_env_var() {
+        // Token used but source unknown → generic auth "yes" and generic hint;
+        // no token → auth "no" and no hint.
+        let (port, _count) =
+            spawn_canned_server(vec![unauthorized_response(), unauthorized_response()]).await;
+        let url = format!("http://127.0.0.1:{port}/repos/owner/repo/releases");
+
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let status_error = resp.error_for_status_ref().unwrap_err();
+        let body = resp.text().await.unwrap();
+        let used_msg = format!(
+            "{:?}",
+            github_unauthorized_report(status_error, true, None, &body)
+        );
+        assert!(used_msg.contains("github auth: yes"), "{used_msg}");
+        assert!(!used_msg.contains("token from"), "{used_msg}");
+        assert!(used_msg.contains("configured GitHub token"), "{used_msg}");
+
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let status_error = resp.error_for_status_ref().unwrap_err();
+        let body = resp.text().await.unwrap();
+        let anon_msg = format!(
+            "{:?}",
+            github_unauthorized_report(status_error, false, None, &body)
+        );
+        assert!(anon_msg.contains("github auth: no"), "{anon_msg}");
+        assert!(!anon_msg.contains("hint:"), "{anon_msg}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_github_unauthorized_report_ignores_env_var_when_no_auth_sent() {
+        // A GitHub token env var may be present in the process even when this
+        // request sent no Authorization header; it must not be reported as used.
+        let (port, _count) = spawn_canned_server(vec![unauthorized_response()]).await;
+        let url = format!("http://127.0.0.1:{port}/repos/owner/repo/releases");
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        let status_error = resp.error_for_status_ref().unwrap_err();
+        let body = resp.text().await.unwrap();
+        let msg = format!(
+            "{:?}",
+            github_unauthorized_report(status_error, false, Some("GITHUB_TOKEN"), &body)
+        );
+
+        assert!(msg.contains("github auth: no"), "{msg}");
+        assert!(!msg.contains("token from"), "{msg}");
+        assert!(!msg.contains("hint:"), "{msg}");
     }
 
     #[test]
