@@ -609,6 +609,30 @@ pub async fn pick_reachable_asset_url(browser_url: &str, api_url: &str) -> Strin
     }
 }
 
+/// Standard GitHub token env vars, in precedence order (applies to every host).
+const GITHUB_TOKEN_ENV_VARS: &[&str] = &["MISE_GITHUB_TOKEN", "GITHUB_API_TOKEN", "GITHUB_TOKEN"];
+
+/// Returns the env var that would supply a GitHub token for `host`, if one is set.
+///
+/// Side-effect free (no `credential_command`, OAuth, or network) so it is safe to
+/// call on an error path — unlike [`resolve_token`], which can re-spawn the
+/// credential helper. Mirrors the env-var precedence in [`resolve_token`] and is
+/// intended for surfacing which variable was used in error messages.
+pub fn auth_env_var_for_host(host: &str) -> Option<&'static str> {
+    let is_ghcom = host == "github.com" || host == "api.github.com";
+    if !is_ghcom
+        && env::MISE_GITHUB_ENTERPRISE_TOKEN
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+    {
+        return Some("MISE_GITHUB_ENTERPRISE_TOKEN");
+    }
+    GITHUB_TOKEN_ENV_VARS
+        .iter()
+        .copied()
+        .find(|var_name| std::env::var(var_name).is_ok_and(|t| !t.trim().is_empty()))
+}
+
 /// Resolve the GitHub token for the given hostname, returning the token and its source.
 ///
 /// Priority:
@@ -638,7 +662,7 @@ pub fn resolve_token(host: &str) -> Option<(String, TokenSource)> {
     }
 
     // 2. Standard env vars (checked individually for correct precedence and source reporting)
-    for var_name in &["MISE_GITHUB_TOKEN", "GITHUB_API_TOKEN", "GITHUB_TOKEN"] {
+    for var_name in GITHUB_TOKEN_ENV_VARS {
         if let Some(token) = std::env::var(var_name)
             .ok()
             .map(|t| t.trim().to_string())
