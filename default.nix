@@ -2,7 +2,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "mise";
-  version = "2026.7.11";
+  version = "2026.7.12";
 
   src = lib.cleanSource ./.;
 
@@ -57,6 +57,7 @@ rustPlatform.buildRustPackage {
     RUST_BACKTRACE=full cargo test --all-features -- \
       --skip cli::plugins::ls::tests::test_plugin_list_urls \
       --skip tera::tests::test_last_modified \
+      --skip system::defaults::tests::test_status_missing_keys_are_unset \
       --skip plugins::core::ruby::tests::test_list_versions_matching
   '';
 

@@ -1324,9 +1324,9 @@
               "type": "string",
               "enum": ["auto", "npm", "aube", "bun", "pnpm"]
             },
-            "use_npm_view": {
+            "shell_out": {
               "default": false,
-              "description": "Use the npm CLI (`npm view`) for version metadata queries instead of mise's built-in registry client.",
+              "description": "Shell out to the npm CLI for `npm:` version metadata and installs instead of mise's built-in aube-based implementation.",
               "type": "boolean"
             }
           }
@@ -1984,6 +1984,11 @@
           "items": {
             "type": "string"
           }
+        },
+        "windows_powershell_no_profile": {
+          "default": true,
+          "description": "Pass `-NoProfile` to PowerShell (`pwsh`/`powershell`) shells that mise spawns for tasks and inline commands, so startup profiles are skipped.",
+          "type": "boolean"
         },
         "windows_shim_mode": {
           "default": "exe",

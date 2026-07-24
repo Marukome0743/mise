@@ -63,6 +63,7 @@ pub mod task_template;
 pub mod task_tool_installer;
 
 pub use task_confirm::TaskConfirm;
+pub(crate) use task_load_context::monorepo_scope;
 pub use task_load_context::{TaskLoadContext, expand_colon_task_syntax};
 pub use task_output::TaskOutput;
 pub use task_script_parser::{has_any_args_defined, has_any_usage_spec};
@@ -1744,11 +1745,12 @@ impl Task {
         // A malformed explicit shell (e.g. an unbalanced quote in a path with
         // spaces) must fail loudly rather than silently falling back to the
         // default shell and running the task under the wrong interpreter.
-        let shell_cmd = crate::path::split_shell_command(shell)?;
+        let mut shell_cmd = crate::path::split_shell_command(shell)?;
         if shell_cmd.is_empty() || shell_cmd[0].trim().is_empty() {
             warn!("invalid shell '{shell}', expected '<program> <argument>' (e.g. sh -c)");
             Ok(None)
         } else {
+            config::Settings::get().maybe_no_profile(&mut shell_cmd);
             Ok(Some(shell_cmd))
         }
     }

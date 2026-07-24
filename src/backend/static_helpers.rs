@@ -690,7 +690,52 @@ pub fn install_artifact(
             };
             rename_executable_in_dir(&search_dir, &rename_to, Some(tool_name))?;
         }
+
+        // When neither bin= nor rename_exe= is set, auto-clean a single extracted
+        // binary whose filename carries an OS/arch platform suffix (e.g. a linux
+        // archive shipping `tool-macos-aarch64`), mirroring the behavior for
+        // single-file (non-archive) downloads. See discussion #6532.
+        if lookup_with_fallback(opts, "bin").is_none()
+            && lookup_with_fallback(opts, "rename_exe").is_none()
+        {
+            let search_dir = explicit_bin_path.as_deref().unwrap_or(&install_path);
+            auto_clean_single_archive_binary(search_dir, tool_name)?;
+        }
     }
+    Ok(())
+}
+
+/// When an archive contains a single binary whose filename carries an OS/arch
+/// platform suffix (e.g. `tool-macos-aarch64`), rename it to the cleaned name
+/// (`tool`), matching what single-file (non-archive) downloads already do.
+///
+/// Only acts when the directory holds exactly one relevant file and cleaning
+/// actually changes the name, so multi-binary archives and files without a
+/// platform suffix are left untouched. See discussion #6532.
+fn auto_clean_single_archive_binary(dir: &Path, tool_name: &str) -> eyre::Result<()> {
+    let files = file::ls(dir)?
+        .into_iter()
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            !should_skip_file(&name, true)
+        })
+        .collect::<Vec<_>>();
+    let [path] = files.as_slice() else {
+        return Ok(());
+    };
+    let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+    let cleaned_name = clean_binary_name(&file_name, Some(tool_name));
+    if cleaned_name == file_name {
+        return Ok(());
+    }
+    let dest = dir.join(&cleaned_name);
+    if dest.exists() {
+        return Ok(());
+    }
+    file::rename(path, &dest)?;
+    file::make_executable(&dest)?;
+    debug!("Auto-cleaned archive binary {file_name} -> {cleaned_name}");
     Ok(())
 }
 
@@ -855,7 +900,7 @@ pub fn rename_executable_in_dir(
                     );
                     return Ok(());
                 }
-                if file_name.contains(tool_name) {
+                if file_name.to_lowercase().contains(&tool_name.to_lowercase()) {
                     if substring_match.is_none() {
                         substring_match = Some(path);
                     }
@@ -900,7 +945,9 @@ pub fn rename_executable_in_dir(
                 }
 
                 // Check if filename matches tool name pattern or the target name
-                if file_name.contains(tool_name) || *file_name == *new_name {
+                if file_name.to_lowercase().contains(&tool_name.to_lowercase())
+                    || *file_name == *new_name
+                {
                     let target_path_with_extension =
                         keep_required_extensions(dir, &file_name, new_name, target_path);
 
@@ -1908,5 +1955,71 @@ bin = "tool.exe"
         assert!(!file::is_executable(&readme));
         assert!(!file::is_executable(&config));
         assert!(!file::is_executable(&unrelated));
+    }
+
+    #[test]
+    fn test_auto_clean_single_archive_binary_strips_platform_suffix() {
+        // A single-file archive whose inner binary carries a platform suffix that
+        // doesn't match the host (linux archive shipping a macos-named binary)
+        // should still be renamed to the clean tool name. See discussion #6532.
+        let tmp = tempfile::tempdir().unwrap();
+        let extracted = tmp.path().join("gdscript-formatter-macos-aarch64");
+        std::fs::write(&extracted, b"not-a-binary").unwrap();
+
+        auto_clean_single_archive_binary(tmp.path(), "GDScript-formatter").unwrap();
+
+        let cleaned = tmp.path().join("gdscript-formatter");
+        assert!(cleaned.is_file(), "binary should be renamed to clean name");
+        assert!(file::is_executable(&cleaned));
+        assert!(!extracted.exists(), "suffixed name should no longer exist");
+    }
+
+    #[test]
+    fn test_auto_clean_single_archive_binary_leaves_multi_file_archive() {
+        // With more than one relevant file we cannot tell which is the binary,
+        // so nothing should be renamed.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("tool-linux-x86_64");
+        let b = tmp.path().join("helper-linux-x86_64");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+
+        auto_clean_single_archive_binary(tmp.path(), "tool").unwrap();
+
+        assert!(a.is_file());
+        assert!(b.is_file());
+        assert!(!tmp.path().join("tool").exists());
+        assert!(!tmp.path().join("helper").exists());
+    }
+
+    #[test]
+    fn test_auto_clean_single_archive_binary_leaves_already_clean_name() {
+        // A single file without a platform suffix must be left untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("tool");
+        std::fs::write(&bin, b"x").unwrap();
+
+        auto_clean_single_archive_binary(tmp.path(), "tool").unwrap();
+
+        assert!(bin.is_file());
+        assert_eq!(file::ls(tmp.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_rename_executable_in_dir_is_case_insensitive() {
+        // The tool_name (repo short name) can differ in case from the extracted
+        // file, e.g. `GDScript-formatter` vs `gdscript-formatter-macos-aarch64`.
+        // The substring match must be case-insensitive so `bin=`/`rename_exe=`
+        // can locate the file. See discussion #6532.
+        let tmp = tempfile::tempdir().unwrap();
+        let extracted = tmp.path().join("gdscript-formatter-macos-aarch64");
+        std::fs::write(&extracted, b"x").unwrap();
+        file::make_executable(&extracted).unwrap();
+
+        rename_executable_in_dir(tmp.path(), "gdscript-formatter", Some("GDScript-formatter"))
+            .unwrap();
+
+        assert!(tmp.path().join("gdscript-formatter").is_file());
+        assert!(!extracted.exists());
     }
 }

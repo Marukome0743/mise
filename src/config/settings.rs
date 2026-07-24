@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use std::{
     collections::{BTreeSet, HashSet},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use super::{TOML_CONFIG_FILENAMES, load_config_paths};
@@ -231,6 +231,12 @@ impl serde::Serialize for PythonUvVenvAuto {
 pub type SettingsPartial = <Settings as Config>::Layer;
 
 static BASE_SETTINGS: RwLock<Option<Arc<Settings>>> = RwLock::new(None);
+/// Caches the resolved `safe` value from the most recent settings load so
+/// `safe_mode()` answers correctly during the config parse pass that runs before
+/// settings are (re)loaded — e.g. after `Config::reset()`. This captures `safe`
+/// set via global config, which the `MISE_SAFE` env-var fallback cannot see.
+/// 0 = false, 1 = true, 2 = never loaded (fall back to the env var).
+static LAST_SAFE: AtomicU8 = AtomicU8::new(2);
 static CLI_SETTINGS: Mutex<Option<SettingsPartial>> = Mutex::new(None);
 static PENDING_DEPRECATED_SETTINGS: Lazy<Mutex<BTreeSet<&'static str>>> =
     Lazy::new(Default::default);
@@ -582,6 +588,7 @@ impl Settings {
             settings.experimental = true;
         }
         let settings = Arc::new(settings);
+        LAST_SAFE.store(u8::from(settings.safe), Ordering::Relaxed);
         *BASE_SETTINGS.write().unwrap() = Some(settings.clone());
         time!("try_get done");
         trace!("Settings: {:#?}", settings);
@@ -769,8 +776,15 @@ impl Settings {
     }
 
     fn all_settings_files() -> Vec<SettingsPartial> {
+        // In safe mode, ignore `[settings]` from project (non-global) config so
+        // an untrusted repo cannot change mise's behavior during resolution
+        // (e.g. disable verification, redirect a backend/registry). Global and
+        // system config is operator-owned and still applies. A specific setting
+        // could be allowlisted here later if it is safe and necessary.
+        let safe_mode = Settings::safe_mode();
         load_config_paths(&TOML_CONFIG_FILENAMES, false)
             .into_iter()
+            .filter(|p| !safe_mode || crate::config::is_global_config(p))
             .map(|p| Self::parse_settings_file(&p))
             .filter_map(|cfg| match cfg {
                 Ok(cfg) => Some(cfg),
@@ -899,7 +913,7 @@ impl Settings {
 
     pub fn fetch_remote_versions_timeout(&self) -> Duration {
         let timeout = self.configured_fetch_remote_versions_timeout();
-        if self.prefer_offline() {
+        if self.bound_remote_version_lookups() {
             timeout.min(Duration::from_secs(3))
         } else {
             timeout
@@ -908,6 +922,19 @@ impl Settings {
 
     pub fn configured_fetch_remote_versions_timeout(&self) -> Duration {
         duration::parse_duration(&self.fetch_remote_versions_timeout).unwrap()
+    }
+
+    /// Whether remote-version lookups should use the aggressive fast-path budget
+    /// (a single ~3s attempt with no retries). This is on under `prefer_offline`
+    /// so shims and shell activation never stall — but NOT for commands whose
+    /// whole job is to enumerate remote versions/tags (`mise lock`, `ls-remote`,
+    /// `outdated`, `upgrade`), which must honor the full configured
+    /// `fetch_remote_versions_timeout` and retry budget even when
+    /// `prefer_offline` is set.
+    ///
+    /// See <https://github.com/jdx/mise/discussions/11185>.
+    pub fn bound_remote_version_lookups(&self) -> bool {
+        self.prefer_offline() && !env::REMOTE_FETCH_COMMAND.load(Ordering::Relaxed)
     }
 
     /// duration that remote version cache is kept for
@@ -935,7 +962,7 @@ impl Settings {
     /// back to cached/local behavior. In particular, shims must not multiply a
     /// stalled resolver timeout by the configured retry count.
     pub fn http_retries(&self) -> i64 {
-        if self.prefer_offline() {
+        if self.bound_remote_version_lookups() {
             0
         } else {
             self.http_retries
@@ -1014,7 +1041,9 @@ impl Settings {
                 Self::UNIX_DEFAULT_INLINE_SHELL_ARGS,
             )
         };
-        split_default_shell_or_fallback(sa, fallback)
+        let mut shell = split_default_shell_or_fallback(sa, fallback)?;
+        self.maybe_no_profile(&mut shell);
+        Ok(shell)
     }
 
     pub fn default_file_shell(&self) -> Result<Vec<String>> {
@@ -1029,7 +1058,17 @@ impl Settings {
                 Self::UNIX_DEFAULT_FILE_SHELL_ARGS,
             )
         };
-        split_default_shell_or_fallback(sa, fallback)
+        let mut shell = split_default_shell_or_fallback(sa, fallback)?;
+        self.maybe_no_profile(&mut shell);
+        Ok(shell)
+    }
+
+    /// Inject `-NoProfile` into a PowerShell shell command when
+    /// `windows_powershell_no_profile` is enabled. No-op for other shells.
+    pub fn maybe_no_profile(&self, shell: &mut Vec<String>) {
+        if self.windows_powershell_no_profile {
+            crate::path::inject_powershell_no_profile(shell);
+        }
     }
 
     pub fn os(&self) -> &str {
@@ -1090,12 +1129,35 @@ impl Settings {
                     .any(|a| a == "--no-hooks")
     }
 
+    /// Whether safe mode (`MISE_SAFE=1` or the `safe` setting) is active.
+    ///
+    /// Safe to call during the config parse pass: it reads the loaded setting
+    /// when settings are available, otherwise falls back to the `MISE_SAFE`
+    /// environment variable. This avoids triggering a recursive settings load
+    /// from `trust_check` (which runs while config files are being parsed,
+    /// before settings are loaded, e.g. after `Config::reset`). `safe` is
+    /// global-only, so it can only come from the environment or global config;
+    /// the env fallback covers the common `MISE_SAFE=1` case in that window.
+    pub fn safe_mode() -> bool {
+        if is_loaded() {
+            return Settings::get().safe;
+        }
+        // Settings not loaded (e.g. the config parse pass after Config::reset).
+        // Use the value cached from the last full load, which captures `safe`
+        // set via global config; before any load, fall back to the env var.
+        match LAST_SAFE.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => crate::env::var_is_true("MISE_SAFE"),
+        }
+    }
+
     /// Errors when safe mode (`MISE_SAFE=1`) is enabled. Call this before any
     /// operation that would execute code controlled by project configuration.
     /// Safe mode is a security boundary: blocked operations must fail loudly,
     /// never silently fall back to something that executes.
     pub fn ensure_not_safe(operation: &str) -> Result<()> {
-        if Settings::get().safe {
+        if Settings::safe_mode() {
             bail!(
                 "{operation} is disabled in safe mode (MISE_SAFE=1)\nSee https://mise.en.dev/configuration/settings.html#safe"
             );

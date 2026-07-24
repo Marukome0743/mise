@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "mise"
-version = "2026.7.11"
+version = "2026.7.12"
 edition = "2024"
 description = "Dev tools, env vars, and tasks in one CLI"
 authors = ["Jeff Dickey (@jdx)"]
@@ -65,6 +65,10 @@ opt-level = 3
 [dependencies]
 age = { version = "0.11", features = ["ssh"] }
 aho-corasick = "1"
+aube-registry = { version = "1.32", default-features = false, features = [
+  "rustls",
+] }
+aube = { version = "1.32", default-features = false, features = ["rustls"] }
 async-backtrace = "0.2"
 async-trait = "0.1"
 aws-config = { version = "1.5", default-features = false, features = [
@@ -171,6 +175,7 @@ rops = { version = "0.1", default-features = false, features = [
   "toml",
   "age",
 ] }
+same-file = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = "1"
@@ -231,7 +236,6 @@ self_update = { version = "0.44", optional = true, default-features = false, fea
   "compression-flate2",
   "signatures",
   "reqwest",
-  "rustls",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -244,7 +248,6 @@ self_update = { version = "0.44", optional = true, default-features = false, fea
   "compression-zip-deflate",
   "signatures",
   "reqwest",
-  "rustls",
 ] }
 zipsign-api = "0.2"
 winapi = { version = "0.3.9", features = ["consoleapi", "minwindef"] }
@@ -280,6 +283,7 @@ native-tls = [
   "ubi/native-tls",
   "vfox/native-tls",
   "xx/native-tls",
+  "self_update?/default-tls",
 ]
 rustls = [
   "gix/blocking-http-transport-reqwest-rust-tls",
@@ -290,6 +294,7 @@ rustls = [
   "ubi/rustls-tls",
   "vfox/rustls",
   "xx/rustls",
+  "self_update?/rustls",
 ]
 rustls-native-roots = [
   "gix/blocking-http-transport-reqwest-rust-tls",
@@ -300,6 +305,7 @@ rustls-native-roots = [
   "ubi/rustls-tls-native-roots",
   "vfox/rustls-native-roots",
   "xx/rustls-native-roots",
+  "self_update?/rustls",
 ]
 
 [package.metadata.binstall]

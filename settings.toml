@@ -1781,21 +1781,28 @@ env = "MISE_NPM_PACKAGE_MANAGER"
 rust_type = "NpmPackageManager"
 type = "String"
 
-[npm.use_npm_view]
+[npm.shell_out]
 default = false
-description = "Use the npm CLI (`npm view`) for version metadata queries instead of mise's built-in registry client."
+description = "Shell out to the npm CLI for `npm:` version metadata and installs instead of mise's built-in aube-based implementation."
 docs = """
-By default, mise queries npm version metadata (`mise ls-remote`, `latest` resolution)
-directly from the npm registry over HTTP, honoring the registry, scoped registries,
-and auth tokens configured in `~/.npmrc` and `NPM_CONFIG_*` environment variables.
-This means node/npm do not need to be installed to resolve `npm:` tool versions.
+By default, mise handles `npm:` tools without needing node/npm installed:
+version metadata (`mise ls-remote`, `latest` resolution) is queried directly
+from the npm registry over HTTP, and packages are installed with mise's
+embedded [aube](https://github.com/jdx/aube) package manager. Both honor the
+registry, scoped registries, and auth tokens configured in `~/.npmrc` and
+`NPM_CONFIG_*` environment variables.
 
-Enable this setting to shell out to `npm view` instead, e.g. if your setup relies on
-npm-specific configuration that mise's registry client does not support, such as
-`cafile`, client certificates, or an auth token helper. When enabled, npm must be
-installed for version queries to work.
+Enable this setting to shell out to the npm CLI instead — `npm view` for
+metadata and `npm install -g` for installs. Use it if your setup relies on
+npm-specific configuration the built-in implementation does not support (such
+as `cafile`, client certificates, or an auth token helper). When enabled, npm
+must be installed.
+
+This applies to the default/`auto` package manager. Explicitly selecting a
+package manager with [`npm.package_manager`](#npm-package-manager) (`bun`,
+`pnpm`, or `npm`) always shells out to that tool regardless of this setting.
 """
-env = "MISE_NPM_USE_NPM_VIEW"
+env = "MISE_NPM_SHELL_OUT"
 type = "Bool"
 
 [oci.default_from]
@@ -2310,12 +2317,18 @@ resolve tool versions from configs the operator did not author.
 When enabled, mise refuses (with an error, never a silent fallback) to:
 
 - run `exec()` or `read_file()` in config templates
-- source shell scripts via the `_.source` env directive
 - run hooks
 - run tasks
 - execute asdf plugin scripts
 - install plugins (already-installed and embedded vfox plugins still work — their
   code was chosen by the operator, not the repository)
+
+It also ignores environment and shell configuration from project (non-global) config —
+`[env]` values, `_.path`, `_.file`, and `[shell_alias]` entries — since those would be
+applied to the host environment (env vars and aliases are emitted through `hook-env`) and
+to subprocesses mise spawns during resolution, an indirect code-execution vector.
+Global/system config is operator-owned and still applies. `_.source` runs a shell script
+(code execution rather than env injection), so it is ignored regardless of source.
 
 Version resolution still works for every HTTP-based backend (core, aqua, github,
 gitlab, http, cargo, pipx, gem, dotnet, npm) as well as `go` (which runs with
@@ -3007,6 +3020,26 @@ env = "MISE_WINDOWS_EXECUTABLE_EXTENSIONS"
 parse_env = "list_by_comma"
 rust_type = "Vec<String>"
 type = "ListString"
+
+[windows_powershell_no_profile]
+default = true
+description = "Pass `-NoProfile` to PowerShell (`pwsh`/`powershell`) shells that mise spawns for tasks and inline commands, so startup profiles are skipped."
+docs = """
+When mise runs a task or inline command through PowerShell, it passes
+`-NoProfile` so the shell does not load the user's PowerShell profile. This
+matches the non-interactive behavior of `sh -c` / `zsh -c` on Unix, which do not
+source interactive startup files.
+
+Profiles that mutate `PATH` — for example a mise activation snippet that prepends
+the shims directory — can otherwise shadow a task's own installed tools and
+produce confusing `cannot find binary path` errors.
+
+Set to `false` if your tasks rely on side effects from your PowerShell profile
+(environment variables, functions, aliases). This only affects `pwsh` and
+`powershell`; it has no effect on `cmd` or on non-Windows shells.
+"""
+env = "MISE_WINDOWS_POWERSHELL_NO_PROFILE"
+type = "Bool"
 
 [windows_shim_mode]
 default = "exe"
