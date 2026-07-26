@@ -65,10 +65,10 @@ opt-level = 3
 [dependencies]
 age = { version = "0.12", features = ["ssh"] }
 aho-corasick = "1"
-aube-registry = { version = "1.32", default-features = false, features = [
+aube-registry = { version = "1.33", default-features = false, features = [
   "rustls",
 ] }
-aube = { version = "1.32", default-features = false, features = ["rustls"] }
+aube = { version = "1.33", default-features = false, features = ["rustls"] }
 async-backtrace = "0.2"
 async-trait = "0.1"
 aws-config = { version = "1.5", default-features = false, features = [
@@ -217,7 +217,7 @@ toml_edit = { version = "0.25", features = ["parse"] }
 ubi = { version = "0.9", default-features = false }
 url = "2"
 urlencoding = "2"
-usage-lib = { version = "3", features = ["clap", "docs"] }
+usage-lib = { version = "4", features = ["clap", "docs"] }
 versions = { version = "7", features = ["serde"] }
 vfox = { path = "crates/vfox", default-features = false }
 aqua-registry = { path = "crates/aqua-registry" }

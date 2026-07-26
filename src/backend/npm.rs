@@ -17,7 +17,10 @@ use crate::install_context::InstallContext;
 use crate::semver::{semver_is_at_least, semver_is_older_than};
 use crate::timeout;
 use crate::toolset::{ToolRequest, ToolVersion, ToolVersionOptions, Toolset};
+use crate::ui::progress_report::SingleReport;
 use async_trait::async_trait;
+use aube::embed::EmbedderRuntime;
+use bytesize::ByteSize;
 use jiff::Timestamp;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -85,6 +88,23 @@ impl<'a> NpmOptions<'a> {
             self.values.raw().opts.get("trust_policy_excludes"),
             "trust_policy_excludes",
         )
+    }
+
+    /// Whether this tool's own package may install despite falling below
+    /// aube's weekly-download threshold. Scoped to the requested package
+    /// only — transitive dependencies stay gated.
+    fn allow_low_downloads(&self) -> eyre::Result<bool> {
+        let Some(value) = self.values.raw().opts.get("allow_low_downloads") else {
+            return Ok(false);
+        };
+        match value {
+            toml::Value::Boolean(value) => Ok(*value),
+            toml::Value::String(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+            toml::Value::String(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+            value => Err(eyre::eyre!(
+                "allow_low_downloads must be a boolean, got {value}"
+            )),
+        }
     }
 
     fn allow_builds(&self) -> eyre::Result<AllowBuilds> {
@@ -869,6 +889,7 @@ impl NPMBackend {
         tv: &ToolVersion,
         options: &NpmOptions<'_>,
     ) -> Result<()> {
+        crate::backend::aube_host::init();
         let install_path = tv.install_path();
         crate::file::create_dir_all(&install_path)?;
 
@@ -882,6 +903,10 @@ impl NPMBackend {
             );
         }
 
+        // aube renders nothing itself: `Events` mode routes the same phase and
+        // progress numbers to us so mise's own progress job stays the only
+        // thing drawing to the terminal. See [`AubeProgressReporter`].
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut opts = aube::embed::AddToProjectOptions {
             // Global-style installs pin the exact resolved version, matching
             // what `aube add --global` wrote to its synthetic manifest.
@@ -890,20 +915,34 @@ impl NPMBackend {
             // `aube.allowBuilds`; only the "allow everything" case needs the
             // invocation flag. `None` leaves scripts skipped (aube's default).
             dangerously_allow_all_builds: matches!(allow_builds, AllowBuilds::All),
-            control: aube::embed::InstallControl::default(),
+            control: aube::embed::InstallControl::events(Arc::new(AubeProgressReporter { tx })),
             // Run dependency lifecycle scripts on the node mise resolved as a
             // dependency, so `allow_builds` installs work even when node isn't
             // on the ambient PATH (the in-process installer doesn't inherit the
             // per-command PATH the old `aube add --global` subprocess got).
-            node_bin_dir: self.aube_embed_node_bin_dir(ctx).await,
+            runtime: self.aube_embed_runtime(ctx).await,
             ..Default::default()
         };
         opts.ignore_scripts = matches!(allow_builds, AllowBuilds::None);
 
         let package = format!("{}@{}", self.tool_name(), tv.version);
-        aube::embed::add(&install_path, std::slice::from_ref(&package), opts)
-            .await
-            .map_err(|e| self.format_aube_install_error(e))?;
+        let install = aube::embed::add(&install_path, std::slice::from_ref(&package), opts);
+        tokio::pin!(install);
+        // Drain events alongside the install rather than after it: the
+        // reporter only enqueues (it must never wait on us while holding an
+        // install worker), so nothing renders unless someone is pulling.
+        let result = loop {
+            tokio::select! {
+                res = &mut install => break res,
+                Some(event) = rx.recv() => apply_aube_event(event, ctx.pr.as_ref()),
+            }
+        };
+        // Events queued between the last poll and the install returning —
+        // notably the terminal `Complete` snapshot.
+        while let Ok(event) = rx.try_recv() {
+            apply_aube_event(event, ctx.pr.as_ref());
+        }
+        result.map_err(|e| self.format_aube_install_error(e))?;
         Ok(())
     }
 
@@ -923,13 +962,18 @@ impl NPMBackend {
         eyre::eyre!(build_aube_install_error_message(&err, &self.ba().full()))
     }
 
-    /// Directory containing the `node` mise resolved as a dependency, handed to
-    /// the embedded aube installer so lifecycle scripts spawn on it. `None` (no
-    /// node dependency resolved) lets aube fall back to an ambient `node`.
-    async fn aube_embed_node_bin_dir(&self, ctx: &InstallContext) -> Option<PathBuf> {
+    /// The `node` mise resolved as a dependency, handed to the embedded aube
+    /// installer so lifecycle scripts spawn on it. `None` (no node dependency
+    /// resolved) lets aube fall back to an ambient `node`.
+    ///
+    /// `selector` is the version-manager shape: mise hands over a real bin dir
+    /// holding `node`/`npm`/`npx`, aube prepends it to PATH and uses that node
+    /// for both `NODE` and `npm_node_execpath`. (`wrapper` is for hosts that
+    /// interpose a shim on `node`; mise resolves the real binary here.)
+    async fn aube_embed_runtime(&self, ctx: &InstallContext) -> Option<EmbedderRuntime> {
         let ts = self.dependency_toolset(&ctx.config).await.ok()?;
         let node = ts.which_bin(&ctx.config, "node").await?;
-        node.parent().map(Path::to_path_buf)
+        node.parent().map(EmbedderRuntime::selector)
     }
 
     /// Write the throwaway project's `package.json` + `.npmrc` for an embedded
@@ -943,6 +987,11 @@ impl NPMBackend {
         options: &NpmOptions,
         allow_builds: &AllowBuilds,
     ) -> Result<()> {
+        // Validate the fallible options before writing anything, so a malformed
+        // value fails without leaving a half-written project dir behind.
+        let trust_policy_excludes = options.aube_trust_policy_excludes_npmrc_value()?;
+        let allow_low_downloads = options.allow_low_downloads()?;
+
         let mut manifest = serde_json::json!({
             "name": "mise-npm-install",
             "private": true,
@@ -968,8 +1017,15 @@ impl NPMBackend {
             // aube documents minimumReleaseAge in minutes, matching pnpm's setting.
             npmrc.push_str(&format!("minimumReleaseAge={minutes}\n"));
         }
-        if let Some(excludes) = options.aube_trust_policy_excludes_npmrc_value()? {
+        if let Some(excludes) = trust_policy_excludes {
             npmrc.push_str(&format!("trustPolicyExclude={excludes}\n"));
+        }
+        if allow_low_downloads {
+            // Exempt only this tool's own package, not the whole install, so a
+            // transitive dependency below the threshold still fails the gate.
+            // aube gates the directly-requested packages, which for mise is
+            // always exactly this one.
+            npmrc.push_str(&format!("allowedUnpopularPackages={}\n", self.tool_name()));
         }
         crate::file::write(install_path.join(".npmrc"), npmrc)?;
         Ok(())
@@ -1093,6 +1149,95 @@ impl NPMBackend {
     }
 }
 
+/// Feeds aube's structured install events into a channel mise drains onto its
+/// own progress job.
+///
+/// aube's default `Human` output mode renders its own clx progress display —
+/// a branded root row with overall counts plus transient child rows per
+/// in-flight tarball fetch — straight to stderr. Because mise and aube both
+/// draw through clx, those rows land as siblings of the job mise already
+/// started for the install, so the user sees two competing progress displays
+/// for one operation, the second one branded by the engine they never chose.
+/// `Events` mode suppresses every one of aube's own writes (the bar, the
+/// `Resolving <pkg>...` lines, and the post-install dependency summary, all of
+/// which are gated on `Human`) and hands the underlying numbers over instead.
+#[derive(Debug)]
+struct AubeProgressReporter {
+    tx: tokio::sync::mpsc::UnboundedSender<aube::embed::InstallEvent>,
+}
+
+impl aube::embed::InstallReporter for AubeProgressReporter {
+    fn report(&self, event: aube::embed::InstallEvent) {
+        // Unbounded, so this never blocks an install worker waiting on us —
+        // what the trait requires. A closed channel means the install already
+        // returned and nobody is left to render the event.
+        let _ = self.tx.send(event);
+    }
+}
+
+/// Render one aube install event onto mise's progress job.
+///
+/// Everything goes in the message; the progress bar is deliberately left
+/// alone. Driving it would mean `set_length(snap.estimated_bytes)`, and that
+/// estimate is a moving, inflated target — aube resolves and downloads
+/// concurrently, so the denominator climbs for most of the install, and it
+/// keeps counting platform-mismatched optional deps that get pruned before
+/// anything fetches them. The result is a bar pinned near 15% with an ETA
+/// swinging between 5s and 30s. The package tally below is the honest number,
+/// and mise's spinner already says the work is live.
+fn apply_aube_event(event: aube::embed::InstallEvent, pr: &dyn SingleReport) {
+    use aube::embed::{InstallEvent, InstallOutputLevel, InstallPhase};
+
+    match event {
+        // The phase repeats on every progress snapshot, which also carries the
+        // counts, so the bare transition needs no separate render.
+        InstallEvent::Phase(_) => {}
+        InstallEvent::Progress(snap) => {
+            let (label, cur, total) = match snap.phase {
+                // Resolving walks a frontier: the denominator is still growing,
+                // and `resolved` can outrun the last total we saw.
+                Some(InstallPhase::Resolving) | None => {
+                    ("resolving", snap.resolved, snap.total.max(snap.resolved))
+                }
+                // Past resolution the package count is final, and progress is
+                // how many are in place — from the store or the network.
+                Some(InstallPhase::Fetching) => {
+                    ("fetching", snap.reused + snap.downloaded, snap.resolved)
+                }
+                Some(InstallPhase::Linking) => {
+                    ("linking", snap.reused + snap.downloaded, snap.resolved)
+                }
+                Some(InstallPhase::Complete) => ("installing", snap.resolved, snap.resolved),
+            };
+
+            // The first snapshot lands before resolution has counted anything;
+            // `0/0 pkgs` is worse than no tally at all.
+            let mut message = if total == 0 {
+                label.to_string()
+            } else {
+                format!("{label} {cur}/{total} pkgs")
+            };
+            // Bytes actually transferred — no denominator, so nothing here can
+            // be wrong the way a percentage would be. Omitted entirely for an
+            // install served from the store, which downloads nothing.
+            if snap.downloaded_bytes > 0 {
+                message.push_str(&format!(
+                    " · {}",
+                    ByteSize::b(snap.downloaded_bytes).display().iec()
+                ));
+            }
+            pr.set_message(message);
+        }
+        // Text aube would have written to stderr itself. Warnings are the
+        // user's business; a fatal error also comes back as the returned
+        // `Err`, so this is never the only place one surfaces.
+        InstallEvent::Output { level, message, .. } => match level {
+            InstallOutputLevel::Info => debug!("aube: {message}"),
+            InstallOutputLevel::Warning | InstallOutputLevel::Error => warn!("{message}"),
+        },
+    }
+}
+
 /// Returns true if `version` is a semver pre-release.
 ///
 /// npm enforces strict semver (rule 9): any hyphen-introduced identifier after
@@ -1179,12 +1324,24 @@ fn build_aube_install_error_message(err: &miette::Report, tool_full: &str) -> St
     }
     if err.code().map(|c| c.to_string()).as_deref() == Some("ERR_AUBE_TRUST_DOWNGRADE") {
         msg.push_str(&format!(
-            "\n\nThis is a supply-chain trust check, not a version-resolution failure. \
-             If you have reviewed the flagged package and want to allow it, add it to \
+            "\n\nThis is a supply-chain trust failure, not an ordinary version-resolution error. \
+             An earlier release had stronger trust evidence than the selected release. \
+             This can indicate a compromised or tampered release; it can also happen when a \
+             maintainer manually publishes, backports outside the trusted workflow, skips \
+             provenance for convenience, or uses a registry that strips metadata.\n\n\
+             Before bypassing, inspect the package's npm release, source tag/commit, publisher \
+             identity, and tarball; compare the metadata with npmjs.org. Confirm the release is \
+             expected and nothing appears tampered with, then report inconsistent evidence to the \
+             relevant upstream owner. Package-release drift belongs with the maintainer; metadata \
+             present on npmjs.org but missing from a proxy or mirror belongs with that registry \
+             operator.\n\n\
+             Only after review, add the narrowest affected `<package>@<version>` to \
              `trust_policy_excludes` for this tool, e.g.:\n  \
-             \"{tool_full}\" = {{ version = \"latest\", trust_policy_excludes = [\"<package>\"] }}\n\
-             or run `mise settings npm.shell_out=true` to install with the npm CLI, which \
-             does not run this check."
+             \"{tool_full}\" = {{ version = \"latest\", trust_policy_excludes = [\"<package>@<version>\"] }}\n\
+             A bare package name exempts every version. `mise settings npm.shell_out=true` uses \
+             the npm CLI and bypasses this check entirely, so it should be a last resort.\n\n\
+             Investigation guide and known exceptions: \
+             https://aube.jdx.dev/security#trust-policy"
         ));
     } else if let Some(help) = err.help() {
         msg.push_str(&format!("\n  help: {help}"));
@@ -1201,6 +1358,7 @@ pub fn install_time_option_keys() -> Vec<String> {
         "aube_args".into(),
         "allow_builds".into(),
         "trust_policy_excludes".into(),
+        "allow_low_downloads".into(),
     ]
 }
 
@@ -1387,9 +1545,16 @@ mod tests {
         assert!(msg.contains("aube install failed: failed to resolve dependencies"));
         assert!(msg.contains("caused by: trust downgrade for @octokit/endpoint@9.0.6"));
         // mise-native remediation replaces aube's .npmrc-oriented help.
+        assert!(msg.contains("not an ordinary version-resolution error"));
+        assert!(msg.contains("stronger trust evidence than the selected release"));
+        assert!(msg.contains("nothing appears tampered with"));
+        assert!(msg.contains("report inconsistent evidence to the relevant upstream owner"));
+        assert!(msg.contains("belongs with that registry operator"));
+        assert!(msg.contains("narrowest affected `<package>@<version>`"));
         assert!(msg.contains("trust_policy_excludes"));
         assert!(msg.contains("\"npm:danger\""));
         assert!(msg.contains("npm.shell_out=true"));
+        assert!(msg.contains("https://aube.jdx.dev/security#trust-policy"));
     }
 
     #[test]
@@ -1896,6 +2061,95 @@ mod tests {
             manifest["aube"]["allowBuilds"],
             serde_json::json!({ "esbuild": true })
         );
+    }
+
+    #[test]
+    fn test_write_aube_embed_project_scopes_allow_low_downloads_to_the_tool() {
+        let backend = create_npm_backend("bibtex-tidy");
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("npm-bibtex-tidy").join("1.14.0");
+        crate::file::create_dir_all(&install_path).unwrap();
+        let mut raw_options = ToolVersionOptions::default();
+        raw_options.opts.insert(
+            "allow_low_downloads".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let options = NpmOptions::new(&raw_options);
+        let allow_builds = options.allow_builds().unwrap();
+
+        backend
+            .write_aube_embed_project(&install_path, None, &options, &allow_builds)
+            .unwrap();
+
+        // Only the requested package is exempt — not a wildcard, so a
+        // transitive dependency below the threshold still fails aube's gate.
+        let npmrc = std::fs::read_to_string(install_path.join(".npmrc")).unwrap();
+        assert!(npmrc.contains("allowedUnpopularPackages=bibtex-tidy\n"));
+        assert!(!npmrc.contains('*'));
+        assert!(!npmrc.contains("lowDownloadThreshold"));
+    }
+
+    #[test]
+    fn test_write_aube_embed_project_writes_nothing_when_an_option_is_malformed() {
+        let backend = create_npm_backend("bibtex-tidy");
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("npm-bibtex-tidy").join("1.14.0");
+        crate::file::create_dir_all(&install_path).unwrap();
+        let mut raw_options = ToolVersionOptions::default();
+        raw_options.opts.insert(
+            "allow_low_downloads".to_string(),
+            toml::Value::Integer(1000),
+        );
+        let options = NpmOptions::new(&raw_options);
+        let allow_builds = options.allow_builds().unwrap();
+
+        assert!(
+            backend
+                .write_aube_embed_project(&install_path, None, &options, &allow_builds)
+                .is_err()
+        );
+        // Options are validated up front, so the aborted call leaves no
+        // half-written project behind for a later step to trip over.
+        assert!(!install_path.join("package.json").exists());
+        assert!(!install_path.join(".npmrc").exists());
+    }
+
+    #[test]
+    fn test_allow_low_downloads_defaults_off_and_rejects_non_bool() {
+        let empty = ToolVersionOptions::default();
+        assert!(!NpmOptions::new(&empty).allow_low_downloads().unwrap());
+
+        let mut string_true = ToolVersionOptions::default();
+        string_true.opts.insert(
+            "allow_low_downloads".to_string(),
+            toml::Value::String("true".into()),
+        );
+        assert!(NpmOptions::new(&string_true).allow_low_downloads().unwrap());
+
+        let mut bad = ToolVersionOptions::default();
+        bad.opts.insert(
+            "allow_low_downloads".to_string(),
+            toml::Value::Integer(1000),
+        );
+        assert!(NpmOptions::new(&bad).allow_low_downloads().is_err());
+    }
+
+    #[test]
+    fn test_write_aube_embed_project_omits_allow_low_downloads_by_default() {
+        let backend = create_npm_backend("bibtex-tidy");
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("npm-bibtex-tidy").join("1.14.0");
+        crate::file::create_dir_all(&install_path).unwrap();
+        let raw_options = ToolVersionOptions::default();
+        let options = NpmOptions::new(&raw_options);
+        let allow_builds = options.allow_builds().unwrap();
+
+        backend
+            .write_aube_embed_project(&install_path, None, &options, &allow_builds)
+            .unwrap();
+
+        let npmrc = std::fs::read_to_string(install_path.join(".npmrc")).unwrap();
+        assert!(!npmrc.contains("allowedUnpopularPackages"));
     }
 
     #[test]

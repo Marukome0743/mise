@@ -296,6 +296,52 @@ To exempt only selected versions, use aube's package-version pattern syntax:
 `trust_policy_excludes` is written to the aube install `.npmrc` as `trustPolicyExclude`. It does
 not affect `npm`, `pnpm`, or `bun` installs.
 
+### `allow_low_downloads`
+
+Allows the requested package to install even though its weekly download count falls below aube's
+`lowDownloadThreshold` (1000 by default). Without it, aube refuses:
+
+```
+refusing to add some-tool: only 930 weekly downloads (threshold: 1000).
+```
+
+```toml
+[tools]
+"npm:some-tool" = { version = "latest", allow_low_downloads = true }
+```
+
+The exemption is scoped to the package you asked for, written to the aube install `.npmrc` as
+`allowedUnpopularPackages=<package>`. Transitive dependencies stay gated, and the threshold itself
+is left alone — so this cannot silently admit an unpopular dependency you did not choose.
+
+Download count is a popularity signal, not a safety one: a low count means few others have vetted
+the package, so prefer confirming you trust the publisher over reaching for this. It does not affect
+`npm`, `pnpm`, or `bun` installs.
+
+### Investigating trust downgrades
+
+A `trustPolicy=no-downgrade` failure is a supply-chain signal, not an ordinary inability to find a
+matching version. It means an earlier release had stronger npm trusted-publisher, staged-publish,
+or provenance evidence than the selected release.
+
+Before adding an exception:
+
+1. Inspect the npm release, source tag/commit, publisher identity, and tarball, compare the metadata
+   with npmjs.org, and confirm nothing appears tampered with.
+2. Check whether the maintainer intentionally published manually, backported outside the trusted
+   workflow, skipped provenance, or used a registry that stripped metadata.
+3. Report inconsistent evidence to the relevant upstream owner. Package-release drift belongs with
+   the maintainer; metadata present on npmjs.org but missing from a proxy or mirror belongs with
+   that registry operator.
+4. Prefer a version-scoped `"<package>@<version>"` exception after review. A bare package name
+   exempts every future version.
+
+Using `mise settings npm.shell_out=true` switches to the npm CLI and bypasses this aube check
+entirely, so it should be a last resort rather than the first workaround.
+
+See aube's [trust-policy documentation](https://aube.jdx.dev/security#trust-policy) for more
+detail.
+
 ### `aube_args`
 
 Additional arguments to pass to `aube add --global` when

@@ -223,6 +223,81 @@ pub async fn task_cwd(task: &Task, config: &Arc<Config>) -> Result<PathBuf> {
     }
 }
 
+/// Collect source file metadatas for a task, anchored at the correct workspace root.
+async fn collect_source_metadatas(
+    task: &Task,
+    config: &Arc<Config>,
+) -> Result<(PathBuf, Vec<(PathBuf, fs::Metadata)>)> {
+    let root = task_cwd(task, config).await?;
+    // Anchor the Override matcher at the outermost config root that is an
+    // ancestor of the task CWD (i.e. the workspace root). This allows
+    // workspace-rooted patterns like `{{ config_root }}/lib/**/*` to be
+    // correctly relativized so that files inside a subproject directory are
+    // not silently dropped.
+    //
+    // config.project_root cannot be used directly: BTreeMap iterates by
+    // lexicographic path order, so a subproject config may be returned
+    // before the workspace root config (mise.toml) even though
+    // the workspace root has a shorter path.
+    let match_root_owned = config
+        .config_files
+        .values()
+        .filter_map(|cf| cf.project_root())
+        .filter(|pr| root.starts_with(pr) || *pr == root)
+        .min_by_key(|p| p.components().count())
+        .unwrap_or_else(|| root.clone());
+    let match_root = match_root_owned.as_path();
+    let matcher = build_source_matcher(match_root, &root, &task.sources);
+    let glob_patterns = source_glob_patterns(&task.sources);
+    let mut source_metadatas = get_file_metadatas(&root, &glob_patterns, &matcher)?;
+    // Always include every file that contributed to the task definition,
+    // regardless of excludes — a stray `!mise.toml` must not silently
+    // disable invalidation.
+    for config_source in task.config_sources() {
+        let config_path = if config_source.is_absolute() {
+            config_source.to_path_buf()
+        } else {
+            root.join(config_source)
+        };
+        if let Ok(meta) = config_path.metadata()
+            && meta.is_file()
+            && !source_metadatas.iter().any(|(p, _)| p == &config_path)
+        {
+            source_metadatas.push((config_path, meta));
+        }
+    }
+    Ok((root, source_metadatas))
+}
+
+/// Compute the current source hash for a task. Returns `(hash, hash_file_path)`
+/// or `None` if the task has no sources or no matching files were found.
+async fn compute_source_hash(
+    task: &Task,
+    config: &Arc<Config>,
+) -> Result<Option<(String, PathBuf)>> {
+    if task.sources.is_empty() {
+        return Ok(None);
+    }
+    let use_content_hash = Settings::get().task.source_freshness_hash_contents;
+    let (root, source_metadatas) = collect_source_metadatas(task, config).await?;
+    if source_metadatas.is_empty() {
+        return Ok(None);
+    }
+    let source_hash = if use_content_hash {
+        let cache_path = content_hash_cache_path(task, &root);
+        let mut cache = load_content_hash_cache(&cache_path);
+        let h = file_contents_to_hash(&source_metadatas, &mut cache)?;
+        if let Err(e) = save_content_hash_cache(&cache_path, &cache) {
+            trace!("failed to save content hash cache: {e}");
+        }
+        h
+    } else {
+        file_metadatas_to_hash(&source_metadatas)
+    };
+    let source_hash_path = sources_hash_path(task, &root, use_content_hash);
+    Ok(Some((source_hash, source_hash_path)))
+}
+
 /// Check if task sources are up to date (fresher than outputs)
 pub async fn sources_are_fresh(task: &Task, config: &Arc<Config>) -> Result<bool> {
     if task.sources.is_empty() {
@@ -233,44 +308,7 @@ pub async fn sources_are_fresh(task: &Task, config: &Arc<Config>) -> Result<bool
     let equal_mtime_is_fresh = settings.task.source_freshness_equal_mtime_is_fresh;
 
     let run = async || -> Result<bool> {
-        let root = task_cwd(task, config).await?;
-        // Anchor the Override matcher at the outermost config root that is an
-        // ancestor of the task CWD (i.e. the workspace root). This allows
-        // workspace-rooted patterns like `{{ config_root }}/lib/**/*` to be
-        // correctly relativized so that files inside a subproject directory are
-        // not silently dropped.
-        //
-        // config.project_root cannot be used directly: BTreeMap iterates by
-        // lexicographic path order, so a subproject config may be returned
-        // before the workspace root config (mise.toml) even though
-        // the workspace root has a shorter path.
-        let match_root_owned = config
-            .config_files
-            .values()
-            .filter_map(|cf| cf.project_root())
-            .filter(|pr| root.starts_with(pr) || *pr == root)
-            .min_by_key(|p| p.components().count())
-            .unwrap_or_else(|| root.clone());
-        let match_root = match_root_owned.as_path();
-        let matcher = build_source_matcher(match_root, &root, &task.sources);
-        let glob_patterns = source_glob_patterns(&task.sources);
-        let mut source_metadatas = get_file_metadatas(&root, &glob_patterns, &matcher)?;
-        // Always include every file that contributed to the task definition,
-        // regardless of excludes — a stray `!mise.toml` must not silently
-        // disable invalidation.
-        for config_source in task.config_sources() {
-            let config_path = if config_source.is_absolute() {
-                config_source.to_path_buf()
-            } else {
-                root.join(config_source)
-            };
-            if let Ok(meta) = config_path.metadata()
-                && meta.is_file()
-                && !source_metadatas.iter().any(|(p, _)| p == &config_path)
-            {
-                source_metadatas.push((config_path, meta));
-            }
-        }
+        let (root, source_metadatas) = collect_source_metadatas(task, config).await?;
 
         // Check if sources resolved to no files (likely a config mistake)
         if source_metadatas.is_empty() {
@@ -320,23 +358,32 @@ pub async fn sources_are_fresh(task: &Task, config: &Arc<Config>) -> Result<bool
                 },
                 source_hash_path.display()
             );
-            file::write(&source_hash_path, &source_hash)?;
+            // Do not write the hash here — the task is about to run. If it
+            // fails, the baseline must stay at the previous value so the next
+            // invocation still detects the mismatch. save_checksum writes the
+            // hash after a successful run.
             return Ok(false);
         }
         let sources = get_last_modified_from_metadatas(&source_metadatas);
         let outputs = get_last_modified(&root, &task.outputs.paths(task, &root))?;
-        file::write(&source_hash_path, &source_hash)?;
         trace!("sources: {sources:?}, outputs: {outputs:?}");
-        match (sources, outputs) {
+        let fresh = match (sources, outputs) {
             (Some(sources), Some(outputs)) => {
                 if equal_mtime_is_fresh {
-                    Ok(sources <= outputs)
+                    sources <= outputs
                 } else {
-                    Ok(sources < outputs)
+                    sources < outputs
                 }
             }
-            _ => Ok(false),
+            _ => false,
+        };
+        if fresh {
+            // Write a snapshot of the current hash so future checks can detect
+            // source changes even when mtime would appear fresh (e.g. after a
+            // touch or a cache restore).
+            file::write(&source_hash_path, &source_hash)?;
         }
+        Ok(fresh)
     };
     Ok(run().await.unwrap_or_else(|err| {
         warn!("sources_are_fresh: {err:?}");
@@ -384,6 +431,15 @@ pub async fn save_checksum(task: &Task, config: &Arc<Config>) -> Result<()> {
             }
         }
     }
+    // Persist the source hash now that the task has succeeded. Doing this here
+    // rather than in sources_are_fresh ensures a failed run never advances the
+    // baseline — the next invocation will detect a mismatch and re-run.
+    if let Some((hash, path)) = compute_source_hash(task, config).await? {
+        if let Some(dir) = path.parent() {
+            file::create_dir_all(dir)?;
+        }
+        file::write(&path, &hash)?;
+    }
     Ok(())
 }
 
@@ -397,6 +453,9 @@ fn task_state_key(task: &Task, root: &Path) -> String {
     task.hash(&mut hasher);
     task.config_sources().hash(&mut hasher);
     root.hash(&mut hasher);
+    task.run.hash(&mut hasher);
+    task.sources.hash(&mut hasher);
+    task.outputs.patterns().hash(&mut hasher);
     format!("{:x}", hasher.finish())
 }
 
@@ -615,6 +674,35 @@ mod tests {
             .push(PathBuf::from("mise.toml"));
 
         assert_ne!(primary_key, task_state_key(&task, root));
+    }
+
+    #[test]
+    fn task_state_key_changes_when_run_changes() {
+        use crate::task::RunEntry;
+        let root = Path::new("/project");
+        let mut task = Task {
+            name: "build".to_string(),
+            config_source: PathBuf::from("mise.toml"),
+            run: vec![RunEntry::Script("echo v1".to_string())],
+            ..Default::default()
+        };
+        let key_v1 = task_state_key(&task, root);
+        task.run = vec![RunEntry::Script("echo v2".to_string())];
+        assert_ne!(key_v1, task_state_key(&task, root));
+    }
+
+    #[test]
+    fn task_state_key_changes_when_sources_change() {
+        let root = Path::new("/project");
+        let mut task = Task {
+            name: "build".to_string(),
+            config_source: PathBuf::from("mise.toml"),
+            sources: vec!["src.txt".to_string()],
+            ..Default::default()
+        };
+        let key_v1 = task_state_key(&task, root);
+        task.sources = vec!["other.txt".to_string()];
+        assert_ne!(key_v1, task_state_key(&task, root));
     }
 
     #[test]
