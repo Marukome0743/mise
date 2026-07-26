@@ -29,7 +29,7 @@ impl GitPreCommit {
     pub async fn run(self) -> eyre::Result<()> {
         let output = self.generate();
         if self.write {
-            let path = Git::get_root()?.join(".git/hooks").join(&self.hook);
+            let path = Git::get_path("hooks")?.join(&self.hook);
             if path.exists() {
                 let old_path = path.with_extension("old");
                 miseprintln!(
