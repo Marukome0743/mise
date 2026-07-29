@@ -2379,21 +2379,28 @@ pub trait Backend: Debug + Send + Sync {
             plugin.is_installed_err()?;
         }
 
-        // If --force and the install path resolved to a shared dir (but wasn't explicitly
-        // set via --system/--shared), redirect to primary dir to avoid modifying shared installs.
-        if ctx.force
-            && tv.install_path.is_none()
-            && env::install_path_category(&tv.install_path()) != env::InstallPathCategory::Local
-        {
-            tv.install_path = Some(tv.ba().installs_path.join(tv.tv_pathname()));
-        }
-
         // Incomplete markers are keyed by logical tool/version rather than by
         // the physical install path. Use the same logical key as link and
         // uninstall so shared and system installs cannot have their marker
         // cleared while an install is still in progress.
         let state_version = tv.tv_pathname();
         let _state_lock = install_state::lock_tool_version(&tv.ba().short, &state_version)?;
+
+        let mut install_satisfied = self
+            .is_install_satisfied_or_false(&ctx.config, &tv, true)
+            .await
+            && !rolling_reinstall;
+
+        // If the install path resolved to a shared dir (but wasn't explicitly set via
+        // --system/--shared), redirect forced or incompatible installs to the primary dir
+        // to avoid modifying shared installs.
+        if (ctx.force || !install_satisfied)
+            && tv.install_path.is_none()
+            && env::install_path_category(&tv.install_path()) != env::InstallPathCategory::Local
+        {
+            tv.install_path = Some(tv.ba().installs_path.join(tv.tv_pathname()));
+            install_satisfied = false;
+        }
 
         let will_uninstall =
             (ctx.force || rolling_reinstall) && self.is_version_installed(&ctx.config, &tv, true);
@@ -2411,11 +2418,7 @@ pub trait Backend: Debug + Send + Sync {
             self.uninstall_version_unlocked(&ctx.config, &tv, ctx.pr.as_ref(), false)
                 .await?;
             ctx.pr.next_operation();
-        } else if self
-            .is_install_satisfied_or_false(&ctx.config, &tv, true)
-            .await
-            && !rolling_reinstall
-        {
+        } else if install_satisfied {
             return Ok(tv);
         }
 
