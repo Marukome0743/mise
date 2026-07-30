@@ -413,6 +413,10 @@ impl Config {
     }
 
     pub fn get_repo_url(&self, plugin_name: &str) -> Option<String> {
+        if let Some(url) = self.repo_urls.get(plugin_name) {
+            return Some(url.clone());
+        }
+
         let plugin_name = self
             .all_aliases
             .get(plugin_name)
@@ -5368,6 +5372,48 @@ config_roots = ["apps/api", "apps/web"]
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_get_repo_url_preserves_explicit_local_paths() {
+        let repo_urls = HashMap::from([
+            (
+                "local-asdf".to_string(),
+                "/tmp/plugins/local-asdf".to_string(),
+            ),
+            (
+                "vfox:local-vfox".to_string(),
+                "/tmp/plugins/local-vfox".to_string(),
+            ),
+        ]);
+        let config = Config {
+            tera_ctx: BASE_CONTEXT.clone(),
+            config_files: Default::default(),
+            env: OnceCell::new(),
+            env_with_sources: OnceCell::new(),
+            shorthands: get_shorthands(&Settings::get()),
+            hooks: OnceCell::new(),
+            tasks_cache: Arc::new(DashMap::new()),
+            tool_request_set: OnceCell::new(),
+            toolset: OnceCell::new(),
+            all_aliases: Default::default(),
+            aliases: Default::default(),
+            project_root: Default::default(),
+            repo_urls,
+            shell_aliases: Default::default(),
+            tera_files: Default::default(),
+            vars: Default::default(),
+            vars_results: OnceCell::new(),
+        };
+
+        assert_eq!(
+            config.get_repo_url("local-asdf").as_deref(),
+            Some("/tmp/plugins/local-asdf")
+        );
+        assert_eq!(
+            config.get_repo_url("local-vfox").as_deref(),
+            Some("/tmp/plugins/local-vfox")
+        );
     }
 
     #[tokio::test]

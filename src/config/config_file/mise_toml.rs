@@ -2,11 +2,12 @@ use eyre::{WrapErr, eyre};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
+use path_absolutize::Absolutize;
 use serde::Deserialize;
 use serde::de::Visitor;
 use serde::{Deserializer, de};
 use std::fmt::{Debug, Formatter};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -919,7 +920,7 @@ impl ConfigFile for MiseToml {
             .into_iter()
             .map(|(k, v)| {
                 let v = self.parse_template(&v)?;
-                Ok((k, v))
+                Ok((k, resolve_plugin_source_path(&self.path, v)?))
             })
             .collect()
     }
@@ -1033,6 +1034,14 @@ impl ConfigFile for MiseToml {
         let key = get_key_with_decor_from(tools, ba.short.as_str(), &existing);
         // and the same for the value, so a comment after the version survives the replacement
         let value_decor = get_value_decor(tools, &existing);
+        // keep the array as it was written so its layout — multi-line shape, trailing comma and any
+        // comments between the elements — can be reused when only the versions change. Read before
+        // the removal below, which drops the entry when it is stored under a long name.
+        let existing_arr = tools
+            .get(&existing)
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_array())
+            .cloned();
 
         // drop the other spellings: they all deserialize to this one entry, so leaving one behind
         // means the file has two keys for one tool and the later one silently wins on read-back.
@@ -1059,11 +1068,18 @@ impl ConfigFile for MiseToml {
             set_value_decor(&mut item, &value_decor);
             tools.insert_formatted(&key, item);
         } else {
-            let mut arr = Array::new();
-            for tr in versions {
+            // Reuse the existing array when the version count is unchanged: swapping the values in
+            // place keeps the layout, including comments written between the elements. A comment
+            // after an element belongs to the decor of the element that follows it, so an array
+            // built from scratch always drops it. When the count changes there is no way to line
+            // the old decor up with the new elements, so build a fresh array as before.
+            let reused = existing_arr.filter(|a| a.len() == versions.len());
+            let reusing = reused.is_some();
+            let mut arr = reused.unwrap_or_else(Array::new);
+            for (i, tr) in versions.into_iter().enumerate() {
                 let v = tr.version();
-                if output_empty_opts(&tr.options()) {
-                    arr.push(v.to_string());
+                let val: Value = if output_empty_opts(&tr.options()) {
+                    v.to_string().into()
                 } else {
                     let mut table = InlineTable::new();
                     table.insert("version", v.to_string().into());
@@ -1072,7 +1088,16 @@ impl ConfigFile for MiseToml {
                         table.insert(k, toml_value_to_edit(v.clone()));
                     }
                     insert_core_options(&mut table, options);
-                    arr.push(table);
+                    table.into()
+                };
+                match reusing.then(|| arr.get_mut(i)).flatten() {
+                    Some(slot) => {
+                        let mut val = val;
+                        *val.decor_mut() = slot.decor().clone();
+                        *slot = val;
+                    }
+                    // `push` applies the default separators, exactly as before
+                    None => arr.push(val),
                 }
             }
             let mut item = Item::Value(Value::Array(arr));
@@ -1352,6 +1377,27 @@ impl ConfigFile for MiseToml {
 
     fn dotfiles_config(&self) -> Option<DotfilesTomlConfig> {
         self.dotfiles.clone()
+    }
+}
+
+fn resolve_plugin_source_path(config_path: &Path, source: String) -> eyre::Result<String> {
+    let source_path = Path::new(&source);
+    let is_explicit_relative = matches!(
+        source_path.components().next(),
+        Some(Component::CurDir | Component::ParentDir)
+    );
+    let expanded = file::replace_path(source_path);
+    let path = if expanded.is_absolute() {
+        Some(expanded)
+    } else if is_explicit_relative {
+        Some(config_root::config_root(config_path).join(expanded))
+    } else {
+        None
+    };
+
+    match path {
+        Some(path) => Ok(path.absolutize()?.to_string_lossy().into_owned()),
+        None => Ok(source),
     }
 }
 
@@ -2629,6 +2675,41 @@ mod tests {
     use crate::{config::Config, dirs::CWD};
 
     use super::*;
+
+    #[test]
+    fn test_resolve_plugin_source_path() {
+        let config_path = Path::new("/tmp/project/mise.toml");
+        let home_plugin = dirs::HOME.join("plugins/example");
+
+        for (source, expected) in [
+            (
+                "/opt/plugins/example",
+                PathBuf::from("/opt/plugins/example"),
+            ),
+            (
+                "./plugins/example",
+                PathBuf::from("/tmp/project/plugins/example"),
+            ),
+            ("../example", PathBuf::from("/tmp/example")),
+            ("~/plugins/example", home_plugin),
+        ] {
+            assert_eq!(
+                resolve_plugin_source_path(config_path, source.to_string()).unwrap(),
+                expected.to_string_lossy()
+            );
+        }
+
+        for source in [
+            "https://github.com/example/plugin.git",
+            "file:///tmp/plugin",
+            "example/plugin",
+        ] {
+            assert_eq!(
+                resolve_plugin_source_path(config_path, source.to_string()).unwrap(),
+                source
+            );
+        }
+    }
 
     #[test]
     fn test_parse_monorepo_project_overrides() {
@@ -3981,6 +4062,171 @@ run = 'echo "template"'
         assert!(
             dump.contains(r#"dummy = ["1.0.1", "2.0.0"] # keep me too"#),
             "comment after a multi-version tool should survive: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_preserves_array_element_comments() {
+        // https://github.com/jdx/mise/discussions/4797
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".array-comments.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            dummy = [
+              "1.0.0", # first
+              "2.0.0", # second
+            ]
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let dummy = "dummy".into();
+        cf.replace_versions(
+            &dummy,
+            vec![
+                ToolRequest::new(Arc::new("dummy".into()), "1.0.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("dummy".into()), "2.0.1", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(indoc! {r#"
+                dummy = [
+                  "1.0.1", # first
+                  "2.0.1", # second
+                ]"#}),
+            "the array should keep its layout with each comment on its own element: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_array_comments_stay_positional() {
+        // A comment written after an array element belongs to the decor of the element that
+        // follows it, so it is tied to a position rather than to a version. Reordering the
+        // versions therefore leaves the comments where the user put them, which is the same rule
+        // the scalar case follows: a comment survives its value changing.
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".array-reorder.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            dummy = [
+              "1.0.0", # first
+              "2.0.0", # second
+            ]
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let dummy = "dummy".into();
+        cf.replace_versions(
+            &dummy,
+            vec![
+                ToolRequest::new(Arc::new("dummy".into()), "2.0.0", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("dummy".into()), "1.0.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(indoc! {r#"
+                dummy = [
+                  "2.0.0", # first
+                  "1.0.0", # second
+                ]"#}),
+            "comments should stay at their position rather than follow a version: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_array_count_change_still_writes() {
+        // a different number of versions cannot reuse the old array's layout, so it falls back to
+        // building a fresh one — the versions themselves still have to be written
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".array-count.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            dummy = ["1.0.0", "2.0.0"]
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let dummy = "dummy".into();
+        cf.replace_versions(
+            &dummy,
+            vec![
+                ToolRequest::new(Arc::new("dummy".into()), "1.0.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("dummy".into()), "2.0.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("dummy".into()), "3.0.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(r#"dummy = ["1.0.1", "2.0.1", "3.0.0"]"#),
+            "all versions should be written: {dump}"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_array_element_comments_survive_alias_rename() {
+        // an aliased entry is renamed to the short name, and the element comments have to come
+        // along. Nothing in the reuse itself states why this works: the array is looked up under
+        // the spelling the file actually uses, which the alias-aware key list supplies. Reading it
+        // from the short name instead would drop these comments again while every other test here
+        // still passed, so pin the combination.
+        let _config = Config::get().await.unwrap();
+        let p = CWD
+            .as_ref()
+            .unwrap()
+            .join(".aliased-array-comments.mise.toml");
+        file::write(
+            &p,
+            formatdoc! {r#"
+            [tools]
+            nodejs = [
+              "20.11.0", # first
+              "22.0.0", # second
+            ]
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let node: BackendArg = "node".into();
+        cf.replace_versions(
+            &node,
+            vec![
+                ToolRequest::new(Arc::new("node".into()), "20.11.1", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new("node".into()), "22.1.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains(indoc! {r#"
+                node = [
+                  "20.11.1", # first
+                  "22.1.0", # second
+                ]"#}),
+            "the renamed key should keep the comments between its elements: {dump}"
+        );
+        assert!(
+            !dump.contains("nodejs"),
+            "the alias must not be left behind as a second key: {dump}"
         );
         file::remove_file(&p).unwrap();
     }
