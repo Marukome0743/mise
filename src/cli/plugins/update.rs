@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
 use console::style;
-use eyre::{Result, WrapErr, eyre};
+use eyre::Result;
 use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::config::Settings;
 use crate::plugins;
 use crate::toolset::install_state;
 use crate::ui::multi_progress_report::MultiProgressReport;
+
+use super::{PluginTaskResult, join_plugin_tasks};
 
 /// Updates a plugin to the latest version
 ///
@@ -42,37 +44,27 @@ impl Update {
         };
 
         let settings = Settings::try_get()?;
-        let mut jset: JoinSet<Result<()>> = JoinSet::new();
+        let mut jset: JoinSet<PluginTaskResult> = JoinSet::new();
         let semaphore = Arc::new(Semaphore::new(self.jobs.unwrap_or(settings.jobs)));
         for (short, ref_) in plugins {
-            let permit = semaphore.clone().acquire_owned().await?;
+            let semaphore = semaphore.clone();
+            let plugin_name = short.clone();
             jset.spawn(async move {
-                let _permit = permit;
-                let plugin = plugins::get(&short)?;
-                let prefix = format!("plugin:{}", style(plugin.name()).blue().for_stderr());
-                let mpr = MultiProgressReport::get();
-                let pr = mpr.add(&prefix);
-                plugin
-                    .update(pr.as_ref(), ref_)
-                    .await
-                    .wrap_err_with(|| format!("[{plugin}] plugin update"))?;
-                Ok(())
+                let result = async {
+                    let _permit = semaphore.acquire_owned().await?;
+                    let plugin = plugins::get(&short)?;
+                    let prefix = format!("plugin:{}", style(plugin.name()).blue().for_stderr());
+                    let mpr = MultiProgressReport::get();
+                    let pr = mpr.add(&prefix);
+                    plugin.update(pr.as_ref(), ref_).await?;
+                    Ok(())
+                }
+                .await;
+                (plugin_name, result)
             });
         }
 
-        while let Some(result) = jset.join_next().await {
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    return Err(e);
-                }
-                Err(e) => {
-                    return Err(eyre!(e));
-                }
-            }
-        }
-
-        Ok(())
+        join_plugin_tasks(jset, "update").await
     }
 }
 
