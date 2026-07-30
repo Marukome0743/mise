@@ -123,6 +123,7 @@ impl Config {
                 *GLOBAL_CONFIG_FILES.lock().unwrap() = None;
                 *SYSTEM_CONFIG_FILES.lock().unwrap() = None;
                 GLOB_RESULTS.lock().unwrap().clear();
+                crate::lockfile::invalidate_caches();
                 crate::task::reset();
                 Ok(())
             },
@@ -413,6 +414,12 @@ impl Config {
     }
 
     pub fn get_repo_url(&self, plugin_name: &str) -> Option<String> {
+        if let Some(url) = self.repo_urls.get(plugin_name)
+            && (Path::new(url).is_absolute() || url.starts_with("file://"))
+        {
+            return Some(url.clone());
+        }
+
         let plugin_name = self
             .all_aliases
             .get(plugin_name)
@@ -428,7 +435,13 @@ impl Config {
             .find(|k| k.ends_with(&format!(":{plugin_name}")))
             .and_then(|k| self.repo_urls.get(k))
         {
-            return Some(url.clone());
+            return Some(
+                if Path::new(url).is_absolute() || url.starts_with("file://") {
+                    url.clone()
+                } else {
+                    registry::full_to_url(url)
+                },
+            );
         }
 
         self.shorthands
@@ -449,6 +462,20 @@ impl Config {
 
     pub fn monorepo_root(&self) -> Option<PathBuf> {
         find_monorepo_root(&self.config_files)
+    }
+
+    pub(crate) fn monorepo_lockfile_discovery_key(
+        &self,
+    ) -> Option<(PathBuf, Option<bool>, Vec<String>)> {
+        let cf = find_monorepo_config(&self.config_files)?;
+        let monorepo = cf.monorepo();
+        Some((
+            cf.get_path().to_path_buf(),
+            monorepo.and_then(|config| config.lockfile),
+            monorepo
+                .map(|config| config.config_roots.clone())
+                .unwrap_or_default(),
+        ))
     }
 
     /// Discovers the provider-neutral workspace project graph and applies the
@@ -562,9 +589,16 @@ impl Config {
 
         let mut union = ToolRequestSet::new();
         for root in roots {
-            let root_paths = config_paths_in_dir_with_filenames(&root, &config_filenames);
+            let root_idiomatic_filenames =
+                idiomatic_filenames_for_root(&root, &idiomatic_filenames).await;
+            let root_config_filenames = root_idiomatic_filenames
+                .keys()
+                .chain(DEFAULT_CONFIG_FILENAMES.iter())
+                .cloned()
+                .collect_vec();
+            let root_paths = config_paths_in_dir_with_filenames(&root, &root_config_filenames);
             let mut root_config_files =
-                load_config_files_from_paths(&root_paths, &idiomatic_filenames).await?;
+                load_config_files_from_paths(&root_paths, &root_idiomatic_filenames).await?;
             for (path, cf) in root_config_files.clone() {
                 config_files.entry(path).or_insert(cf);
             }
@@ -828,22 +862,18 @@ impl Config {
     pub async fn get_tracked_config_files(&self) -> Result<ConfigMap> {
         let mut config_files: ConfigMap = ConfigMap::default();
         for path in Tracker::list_all()?.into_iter() {
-            // Pre-check trust to avoid interactive prompts when loading
-            // tracked configs (e.g., during `mise upgrade`). Only MiseToml files
-            // call trust_check during parsing, but we can't cheaply distinguish
-            // file types here, so we check trust for all files and fall through
-            // to parse for trusted files. Untrusted non-MiseToml files (like
-            // .tool-versions) don't need trust and will parse fine regardless.
+            if config_path_is_ignored(&path, false) {
+                debug!("skipping ignored tracked config: {}", display_path(&path));
+                continue;
+            }
+            // Pre-check trust for config files that require it so tracked
+            // config loading (e.g., during `mise upgrade`) never prompts.
+            // Plain .tool-versions and idiomatic version files are safe to
+            // parse without trust and must still protect their tool versions.
             let trust_root = config_file::config_trust_root(&path);
-            // In safe mode, config is inert and trust is not required, so don't
-            // skip untrusted tracked configs — load them like trusted ones.
-            let safe_mode = Settings::safe_mode();
-            if !safe_mode
+            if config_file::path_requires_trust(&path).await
+                && !is_global_config(&path)
                 && !config_file::is_trusted(&trust_root)
-                && !config_file::is_trusted(&path)
-                // safe mise.toml files load without a trust marker, so a missing
-                // marker doesn't mean they should be skipped here
-                && !MiseToml::path_is_trust_exempt(&path)
             {
                 debug!("skipping untrusted tracked config: {}", display_path(&path));
                 continue;
@@ -1248,14 +1278,25 @@ async fn load_idiomatic_filenames() -> BTreeMap<String, Vec<String>> {
     let settings = Settings::get();
     let enable_tools = settings.idiomatic_version_file_enable_tools.clone();
     let disable_files = settings.idiomatic_version_file_disable_files.clone();
-    if enable_tools.is_empty() {
-        return BTreeMap::new();
-    }
     if !settings.idiomatic_version_file_disable_tools.is_empty() {
         deprecated!(
             "idiomatic_version_file_disable_tools",
             "is deprecated, use idiomatic_version_file_enable_tools instead"
         );
+    }
+    load_idiomatic_filenames_for_tools(&enable_tools, &disable_files).await
+}
+
+/// Same as [`load_idiomatic_filenames`] but for explicit `enable_tools`/`disable_files` rather
+/// than the process-wide `Settings::get()` snapshot. Used by monorepo union resolution, where a
+/// config root's own `idiomatic_version_file_enable_tools` can differ from the settings
+/// resolved from the invocation directory (see [`idiomatic_filenames_for_root`]).
+async fn load_idiomatic_filenames_for_tools(
+    enable_tools: &BTreeSet<String>,
+    disable_files: &BTreeSet<String>,
+) -> BTreeMap<String, Vec<String>> {
+    if enable_tools.is_empty() {
+        return BTreeMap::new();
     }
     let mut jset = JoinSet::new();
     for tool in backend::list() {
@@ -1309,6 +1350,47 @@ fn idiomatic_version_file_disabled(
                 disabled_tool == tool && disabled_filename == filename
             })
     })
+}
+
+/// Resolves idiomatic version filenames for a single monorepo config root, honoring that
+/// root's own `[settings].idiomatic_version_file_enable_tools`/`idiomatic_version_file_disable_files`
+/// if it sets either.
+///
+/// `Settings::get()` is a process-wide snapshot resolved once from the invocation directory
+/// (walking config files upward); it never walks *down* into `[monorepo].config_roots`, so a
+/// config root's own `[settings]` block is otherwise silently ignored by monorepo-wide
+/// commands (e.g. `mise ls --monorepo`) even though the same setting works fine when mise is
+/// actually invoked from within that root. See https://github.com/jdx/mise/discussions/8629.
+async fn idiomatic_filenames_for_root(
+    root: &Path,
+    default_idiomatic_filenames: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    let settings = Settings::get();
+    let mut enable_tools = settings.idiomatic_version_file_enable_tools.clone();
+    let mut disable_files = settings.idiomatic_version_file_disable_files.clone();
+    let mut overridden = false;
+    let safe_mode = Settings::safe_mode();
+    for path in config_paths_in_dir_with_filenames(root, &DEFAULT_CONFIG_FILENAMES) {
+        if safe_mode && !is_global_config(&path) {
+            // Match all_settings_files()'s safe-mode boundary: an untrusted repo's own
+            // [settings] block must not influence resolution, including here.
+            continue;
+        }
+        if let Ok(partial) = Settings::parse_settings_file(&path) {
+            if let Some(tools) = partial.idiomatic_version_file_enable_tools {
+                enable_tools = tools;
+                overridden = true;
+            }
+            if let Some(files) = partial.idiomatic_version_file_disable_files {
+                disable_files = files;
+                overridden = true;
+            }
+        }
+    }
+    if !overridden {
+        return default_idiomatic_filenames.clone();
+    }
+    load_idiomatic_filenames_for_tools(&enable_tools, &disable_files).await
 }
 
 static LOCAL_CONFIG_FILENAMES: Lazy<IndexSet<&'static str>> = Lazy::new(|| {
@@ -5368,6 +5450,66 @@ config_roots = ["apps/api", "apps/web"]
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_get_repo_url_preserves_explicit_local_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_asdf = temp
+            .path()
+            .join("plugins/local-asdf")
+            .to_string_lossy()
+            .into_owned();
+        let local_vfox = temp
+            .path()
+            .join("plugins/local-vfox")
+            .to_string_lossy()
+            .into_owned();
+        let repo_urls = HashMap::from([
+            ("local-asdf".to_string(), local_asdf.clone()),
+            ("vfox:local-vfox".to_string(), local_vfox.clone()),
+            ("remote-asdf".to_string(), "owner/asdf-plugin".to_string()),
+            (
+                "vfox:remote-vfox".to_string(),
+                "owner/vfox-plugin".to_string(),
+            ),
+        ]);
+        let config = Config {
+            tera_ctx: BASE_CONTEXT.clone(),
+            config_files: Default::default(),
+            env: OnceCell::new(),
+            env_with_sources: OnceCell::new(),
+            shorthands: get_shorthands(&Settings::get()),
+            hooks: OnceCell::new(),
+            tasks_cache: Arc::new(DashMap::new()),
+            tool_request_set: OnceCell::new(),
+            toolset: OnceCell::new(),
+            all_aliases: Default::default(),
+            aliases: Default::default(),
+            project_root: Default::default(),
+            repo_urls,
+            shell_aliases: Default::default(),
+            tera_files: Default::default(),
+            vars: Default::default(),
+            vars_results: OnceCell::new(),
+        };
+
+        assert_eq!(
+            config.get_repo_url("local-asdf").as_deref(),
+            Some(local_asdf.as_str())
+        );
+        assert_eq!(
+            config.get_repo_url("local-vfox").as_deref(),
+            Some(local_vfox.as_str())
+        );
+        assert_eq!(
+            config.get_repo_url("remote-asdf").as_deref(),
+            Some("https://github.com/owner/asdf-plugin.git")
+        );
+        assert_eq!(
+            config.get_repo_url("remote-vfox").as_deref(),
+            Some("https://github.com/owner/vfox-plugin.git")
+        );
     }
 
     #[tokio::test]

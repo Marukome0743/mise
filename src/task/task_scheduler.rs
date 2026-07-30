@@ -151,12 +151,14 @@ impl Scheduler {
     /// - no tasks are in-flight AND
     /// - no tasks were recently drained
     ///
-    /// Or if should_stop returns true (for early exit due to failures)
+    /// Or if should_stop returns true (for early exit due to failures or interruption).
+    /// An interruption always stops new work, even in continue-on-error mode.
     pub async fn run_loop<F, Fut>(
         &mut self,
         main_done_rx: &mut tokio::sync::watch::Receiver<bool>,
         main_deps: Arc<Mutex<Deps>>,
         should_stop: impl Fn() -> bool,
+        was_interrupted: impl Fn() -> bool,
         continue_on_error: bool,
         mut spawn_job: F,
     ) -> Result<()>
@@ -165,7 +167,7 @@ impl Scheduler {
         Fut: std::future::Future<Output = Result<()>>,
     {
         let mut sched_rx = self.take_receiver().expect("receiver already taken");
-        let mut failure_cleanup_done = false;
+        let mut stop_cleanup_done = false;
 
         loop {
             // Drain ready tasks without awaiting
@@ -175,7 +177,7 @@ impl Scheduler {
                     Ok((task, deps_for_remove)) => {
                         drained_any = true;
                         trace!("scheduler received: {} {}", task.name, task.args.join(" "));
-                        if should_stop() && !continue_on_error {
+                        if should_stop() && (!continue_on_error || was_interrupted()) {
                             // Still allow post-dep (cleanup) tasks to run on failure,
                             // but only if their parent was actually started
                             let mut deps = deps_for_remove.lock().await;
@@ -192,10 +194,11 @@ impl Scheduler {
                 }
             }
 
-            // Check if we should stop early due to failure (run cleanup only once)
-            if should_stop() && !continue_on_error && !failure_cleanup_done {
-                failure_cleanup_done = true;
-                trace!("scheduler: stopping early due to failure, cleaning up non-post-dep tasks");
+            // Check if we should stop early due to failure or interruption
+            // (run cleanup only once).
+            if should_stop() && (!continue_on_error || was_interrupted()) && !stop_cleanup_done {
+                stop_cleanup_done = true;
+                trace!("scheduler: stopping early, cleaning up non-post-dep tasks");
                 // Clean up tasks that shouldn't run: non-post-deps and post-deps whose
                 // parent was never started. Use batch removal so intermediate emit_leaves
                 // calls don't schedule post-deps of never-started tasks.
@@ -225,7 +228,7 @@ impl Scheduler {
                 m = sched_rx.recv() => {
                     if let Some((task, deps_for_remove)) = m {
                         trace!("scheduler received: {} {}", task.name, task.args.join(" "));
-                        if should_stop() && !continue_on_error {
+                        if should_stop() && (!continue_on_error || was_interrupted()) {
                             let mut deps = deps_for_remove.lock().await;
                             if !deps.is_runnable_post_dep(&task) {
                                 deps.remove(&task);

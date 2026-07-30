@@ -115,6 +115,24 @@ impl Error {
         }
     }
 
+    #[cfg(unix)]
+    pub fn is_sigint(err: &Report) -> bool {
+        use std::os::unix::process::ExitStatusExt;
+
+        err.downcast_ref::<Error>().is_some_and(|err| {
+            matches!(
+                err,
+                Error::ScriptFailed(_, Some(status))
+                    if status.signal() == Some(nix::sys::signal::SIGINT as i32)
+            )
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub fn is_sigint(_err: &Report) -> bool {
+        false
+    }
+
     pub fn is_argument_err(err: &Report) -> bool {
         err.downcast_ref::<Error>()
             .map(|e| {
@@ -127,5 +145,27 @@ impl Error {
                 )
             })
             .unwrap_or(false)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn detects_sigint_script_failure() {
+        let status = ExitStatus::from_raw(nix::sys::signal::SIGINT as i32);
+        let err = Report::new(Error::ScriptFailed("sh".into(), Some(status)));
+
+        assert!(Error::is_sigint(&err));
+    }
+
+    #[test]
+    fn does_not_treat_exit_code_as_sigint() {
+        let status = ExitStatus::from_raw(2 << 8);
+        let err = Report::new(Error::ScriptFailed("sh".into(), Some(status)));
+
+        assert!(!Error::is_sigint(&err));
     }
 }

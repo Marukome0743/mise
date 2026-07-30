@@ -172,16 +172,21 @@ pub(crate) async fn semver_version_from_toolsets_or_path(
     {
         return Some(version);
     }
-    semver_version_from_path(backend, config, tool).await
+    semver_version_from_path(backend, config, ts, tool).await
 }
 
+/// `ts` is threaded through only so the probe can resolve `tool` the same way the install
+/// spawns it — a bare name would be looked up by `Command::new`, which on Windows appends
+/// only `.exe` and so misses the `.cmd` shim the install itself would have used.
 async fn semver_version_from_path(
     backend: &dyn Backend,
     config: &Arc<Config>,
+    ts: &Toolset,
     tool: &str,
 ) -> Option<String> {
     let env = backend.dependency_env(config).await.ok()?;
-    let output = cmd!(tool, "--version").full_env(env).read().ok()?;
+    let program = backend.spawn_program(config, Some(ts), tool).await;
+    let output = cmd!(program, "--version").full_env(env).read().ok()?;
     parse_cli_version_output(&output)
 }
 
@@ -1669,6 +1674,15 @@ pub trait Backend: Debug + Send + Sync {
         &[]
     }
 
+    /// Opaque context that affects this backend's remote version listing.
+    ///
+    /// Backends should return a digest rather than raw values. A non-empty
+    /// context partitions the remote-version cache and disables the shared
+    /// versions host, whose response cannot account for local context.
+    async fn remote_version_cache_context(&self, _config: &Arc<Config>) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// dependencies which wait for install but do not warn, like cargo-binstall
     fn get_optional_dependencies(&self) -> Result<Vec<&str>> {
         Ok(vec![])
@@ -1747,7 +1761,11 @@ pub trait Backend: Debug + Send + Sync {
         config: &Arc<Config>,
         refresh: bool,
     ) -> eyre::Result<Vec<VersionInfo>> {
-        let remote_versions = self.get_remote_version_cache();
+        let cache_context = self.remote_version_cache_context(config).await?;
+        let remote_versions = match cache_context.as_deref() {
+            Some(context) => self.get_remote_version_cache_with_context(Some(context)),
+            None => self.get_remote_version_cache(),
+        };
         let mut remote_versions = remote_versions.lock().await;
         let ba = self.ba().clone();
         let id = self.id();
@@ -1791,6 +1809,12 @@ pub trait Backend: Debug + Send + Sync {
             trace!(
                 "Skipping versions host for {} because {} backend has a direct source",
                 ba.short, backend_type
+            );
+            false
+        } else if cache_context.is_some() {
+            trace!(
+                "Skipping versions host for {} because local context affects remote version listing",
+                ba.short,
             );
             false
         } else if has_local_version_listing_override {
@@ -3167,10 +3191,19 @@ pub trait Backend: Debug + Send + Sync {
         self.dependency_which(config, bin).await
     }
 
-    /// The spawnable path for a dependency program: the same three sources in the same
-    /// preference order as [`Self::dependency_path_for_install`] — the install's own
-    /// toolset, then PATH, then the dependency toolset — except every candidate must be
-    /// something the OS can launch.
+    /// The spawnable path for a dependency program: the same three sources as
+    /// [`Self::dependency_path_for_install`] — the install's own toolset, the dependency
+    /// toolset, and PATH — except every candidate must be something the OS can launch.
+    ///
+    /// The preference order deliberately differs from `dependency_path_for_install`,
+    /// which consults PATH before the dependency toolset. This resolver stands in for
+    /// the search `Command::spawn` used to perform itself: every spawn site hands the
+    /// child an environment whose PATH has the dependency toolset's dirs *prepended*
+    /// (`dependency_env`/`prepend_path`), and std resolves a bare program against that
+    /// child PATH — so the mise-managed tool won. Resolving host PATH first here would
+    /// flip that, and a system npm would beat the node-bundled one for the `ts: None`
+    /// metadata probes (`npm view`, `gem sources`, `go list`). Dependency toolset first
+    /// preserves the old selection.
     ///
     /// Returns `None` only when *nothing spawnable* exists in any of them, which is
     /// strictly stronger than `dependency_path_for_install`'s `None`: a `pipx.ps1`, a
@@ -3178,9 +3211,10 @@ pub trait Backend: Debug + Send + Sync {
     /// past it and keeps looking. Use this for gate and bail decisions so that "we found
     /// it" and "we can run it" stop being two different questions.
     ///
-    /// On unix this is identical to `dependency_path_for_install`: `executable_names`
-    /// yields one name, `can_execute_directly` *is* `is_executable`, and both the
-    /// `is_file()` and shim filters are `cfg!(windows)`-gated.
+    /// On unix the predicate degenerates to today's: `executable_names` yields one name,
+    /// `can_execute_directly` *is* `is_executable`, and both the `is_file()` and shim
+    /// filters are `cfg!(windows)`-gated. (`spawn_program` additionally short-circuits
+    /// on unix and never calls this at all.)
     async fn spawnable_dependency(
         &self,
         config: &Arc<Config>,
@@ -3192,11 +3226,12 @@ pub trait Backend: Debug + Send + Sync {
         {
             return Some(bin);
         }
-        if let Some(bin) = which_non_pristine_spawnable(bin) {
+        if let Ok(dts) = self.dependency_toolset(config).await
+            && let Some(bin) = dts.which_bin_spawnable(config, bin).await
+        {
             return Some(bin);
         }
-        let ts = self.dependency_toolset(config).await.ok()?;
-        ts.which_bin_spawnable(config, bin).await
+        which_non_pristine_spawnable(bin)
     }
 
     /// The program to hand `CmdLineRunner::new` or `cmd!` for `bin`.
@@ -3332,20 +3367,34 @@ pub trait Backend: Debug + Send + Sync {
     }
 
     fn get_remote_version_cache(&self) -> Arc<TokioMutex<VersionCacheManager>> {
+        self.get_remote_version_cache_with_context(None)
+    }
+
+    fn get_remote_version_cache_with_context(
+        &self,
+        context: Option<&str>,
+    ) -> Arc<TokioMutex<VersionCacheManager>> {
         // use a mutex to prevent deadlocks that occurs due to reentrant cache access
         static REMOTE_VERSION_CACHE: Lazy<
             Mutex<HashMap<String, Arc<TokioMutex<VersionCacheManager>>>>,
         > = Lazy::new(Default::default);
 
+        let map_key = match context {
+            Some(context) => format!("{}\0{context}", self.ba().full()),
+            None => self.ba().full(),
+        };
         REMOTE_VERSION_CACHE
             .lock()
             .unwrap()
-            .entry(self.ba().full())
+            .entry(map_key)
             .or_insert_with(|| {
                 let mut cm = CacheManagerBuilder::new(
                     self.ba().cache_path.join("remote_versions.msgpack.z"),
                 )
                 .with_fresh_duration(Settings::get().fetch_remote_versions_cache());
+                if let Some(context) = context {
+                    cm = cm.with_cache_key(context.to_string());
+                }
                 if let Some(plugin_path) = self.plugin().map(|p| p.path()) {
                     cm = cm
                         .with_fresh_file(plugin_path.clone())
@@ -3975,6 +4024,37 @@ mod latest_version_tests {
 
         assert_eq!(versions, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
         assert_eq!(backend.list_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_remote_version_cache_contexts_are_isolated() {
+        let _config = Config::get().await.unwrap();
+        let backend = LatestBackend::new("test-context-cache");
+        let first = backend.get_remote_version_cache_with_context(Some("first"));
+        let second = backend.get_remote_version_cache_with_context(Some("second"));
+
+        first
+            .lock()
+            .await
+            .write(&vec![VersionInfo {
+                version: "1.0.0".to_string(),
+                ..Default::default()
+            }])
+            .unwrap();
+        second
+            .lock()
+            .await
+            .write(&vec![VersionInfo {
+                version: "2.0.0".to_string(),
+                ..Default::default()
+            }])
+            .unwrap();
+
+        assert_eq!(first.lock().await.get_cached().unwrap()[0].version, "1.0.0");
+        assert_eq!(
+            second.lock().await.get_cached().unwrap()[0].version,
+            "2.0.0"
+        );
     }
 
     #[tokio::test]
