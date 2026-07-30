@@ -1,5 +1,5 @@
 use crate::errors::Error::PluginNotInstalled;
-use crate::file;
+use crate::file::{self, display_path};
 use crate::git::{CloneOptions, Git};
 use crate::plugins::asdf_plugin::AsdfPlugin;
 use crate::plugins::vfox_plugin::VfoxPlugin;
@@ -11,7 +11,7 @@ use crate::ui::progress_report::SingleReport;
 use crate::{config::Config, dirs};
 use async_trait::async_trait;
 use clap::Command;
-use eyre::{Result, eyre};
+use eyre::{Result, bail, eyre};
 use heck::ToKebabCase;
 use regex::Regex;
 pub use script_manager::{Script, ScriptManager};
@@ -515,6 +515,50 @@ pub fn install_git_plugin_source(
         }
         Ok(git)
     }
+}
+
+pub fn local_plugin_source_path(repository: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(repository);
+    path.is_absolute().then_some(path)
+}
+
+pub fn validate_local_plugin_source(source: &Path, plugin_path: &Path) -> Result<()> {
+    if !source.exists() {
+        bail!(
+            "local plugin directory does not exist: {}",
+            display_path(source)
+        );
+    }
+    if !source.is_dir() {
+        bail!(
+            "local plugin source is not a directory: {}",
+            display_path(source)
+        );
+    }
+    if file::paths_eq(source, plugin_path) || source.starts_with(plugin_path) {
+        bail!(
+            "local plugin source cannot be the plugin install path or one of its descendants: {}",
+            display_path(source)
+        );
+    }
+    Ok(())
+}
+
+pub fn install_local_plugin_source(
+    plugin_path: &Path,
+    source: &Path,
+    pr: &dyn SingleReport,
+) -> Result<()> {
+    let parent = plugin_path.parent().ok_or_else(|| {
+        eyre!(
+            "plugin install path has no parent: {}",
+            display_path(plugin_path)
+        )
+    })?;
+    file::create_dir_all(parent)?;
+    pr.set_message(format!("link {}", display_path(source)));
+    file::make_symlink(source, plugin_path)?;
+    Ok(())
 }
 
 #[cfg(test)]
