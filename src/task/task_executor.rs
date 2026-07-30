@@ -31,6 +31,7 @@ use std::iter::once;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
@@ -176,6 +177,7 @@ pub struct TaskExecutor {
     pub context_builder: TaskContextBuilder,
     pub output_handler: OutputHandler,
     pub failed_tasks: FailedTasks,
+    interrupted: AtomicBool,
 
     // CLI flags
     pub force: bool,
@@ -206,6 +208,7 @@ impl TaskExecutor {
             context_builder,
             output_handler,
             failed_tasks: Arc::new(StdMutex::new(Vec::new())),
+            interrupted: AtomicBool::new(false),
             force: config.force,
             cd: config.cd,
             shell: config.shell,
@@ -220,7 +223,15 @@ impl TaskExecutor {
     }
 
     pub fn is_stopping(&self) -> bool {
-        !self.failed_tasks.lock().unwrap().is_empty()
+        self.is_interrupted() || !self.failed_tasks.lock().unwrap().is_empty()
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_interrupted(&self) {
+        self.interrupted.store(true, Ordering::Relaxed);
     }
 
     pub fn add_failed_task(&self, task: Task, status: Option<i32>) {

@@ -9,6 +9,7 @@ pub struct TaskResultsDisplay {
     failed_tasks: FailedTasks,
     continue_on_error: bool,
     show_timings: bool,
+    interrupted: bool,
 }
 
 impl TaskResultsDisplay {
@@ -17,12 +18,14 @@ impl TaskResultsDisplay {
         failed_tasks: FailedTasks,
         continue_on_error: bool,
         show_timings: bool,
+        interrupted: bool,
     ) -> Self {
         Self {
             output_handler,
             failed_tasks,
             continue_on_error,
             show_timings,
+            interrupted,
         }
     }
 
@@ -31,7 +34,11 @@ impl TaskResultsDisplay {
         self.display_keep_order_output();
         self.display_timing_summary(num_tasks, timer);
         self.maybe_print_failure_summary();
-        self.exit_if_failed()
+        self.exit_if_failed()?;
+        if self.interrupted {
+            return Err(request_exit(130));
+        }
+        Ok(())
     }
 
     /// Flush any remaining keep-order output (safety net).
