@@ -6,6 +6,8 @@ use std::str::FromStr;
 use eyre::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::{Task, TaskCacheConfig, task_sources::TaskOutputs};
+
 pub mod node;
 
 /// A stable, provider-namespaced identifier for a workspace project.
@@ -73,8 +75,11 @@ pub struct WorkspaceProject {
     pub metadata: BTreeMap<String, String>,
     /// Projects that this project directly depends on.
     pub dependencies: BTreeSet<ProjectId>,
+    /// Provider and metadata source that inferred this project.
+    pub provenance: WorkspaceProvenance,
+    /// Provider attribution for each inferred dependency edge.
+    pub dependency_provenance: BTreeMap<ProjectId, WorkspaceProvenance>,
     /// Tasks inferred from ecosystem-specific project metadata.
-    #[serde(skip)]
     pub tasks: BTreeMap<String, WorkspaceTask>,
 }
 
@@ -86,13 +91,26 @@ impl WorkspaceProject {
             root: root.into(),
             metadata: BTreeMap::new(),
             dependencies: BTreeSet::new(),
+            provenance: WorkspaceProvenance::default(),
+            dependency_provenance: BTreeMap::new(),
             tasks: BTreeMap::new(),
         }
     }
 }
 
+/// Attribution for a value inferred by a workspace provider.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct WorkspaceProvenance {
+    /// Workspace provider that inferred the value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Ecosystem metadata file that supplied the value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<PathBuf>,
+}
+
 /// A provider-neutral task inferred for a workspace project.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkspaceTask {
     /// Command to execute in the project root.
     pub command: String,
@@ -100,6 +118,80 @@ pub struct WorkspaceTask {
     pub description: String,
     /// File relative to the workspace root that supplied the task.
     pub source: PathBuf,
+    /// Provider and metadata source that inferred this task.
+    pub provenance: WorkspaceProvenance,
+    /// Provider-derived task configuration applied before user defaults.
+    pub suggestions: WorkspaceTaskSuggestions,
+}
+
+/// Optional task configuration a workspace provider can derive confidently.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct WorkspaceTaskSuggestions {
+    /// Project-relative input patterns, mapped to mise task sources.
+    pub inputs: Vec<String>,
+    /// Project-relative output patterns. An empty vector means the task has no file outputs.
+    pub outputs: Option<Vec<String>>,
+    /// Whether task output caching should be enabled or disabled.
+    pub cache: Option<bool>,
+    /// Task dependencies, including project-relative and `^task` dependencies. An empty vector
+    /// means the task has no dependencies.
+    pub depends: Option<Vec<String>>,
+    /// Additional metadata files that contributed these suggestions. These paths are used
+    /// internally for cache invalidation and may be absolute, so provenance is the portable
+    /// representation exposed in graph JSON.
+    #[serde(skip)]
+    pub config_sources: Vec<PathBuf>,
+    /// Field-level attribution for provider suggestions.
+    pub provenance: WorkspaceTaskSuggestionProvenance,
+}
+
+/// Provider attribution for each independently suggested task field.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct WorkspaceTaskSuggestionProvenance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<WorkspaceProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<WorkspaceProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<WorkspaceProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depends: Option<WorkspaceProvenance>,
+}
+
+impl WorkspaceTaskSuggestions {
+    pub(crate) fn apply_before_defaults(&self, task: &mut Task) {
+        if !self.inputs.is_empty() {
+            task.sources.clone_from(&self.inputs);
+        }
+        if let Some(outputs) = &self.outputs {
+            task.outputs = if outputs.is_empty() {
+                TaskOutputs::NoFiles
+            } else {
+                TaskOutputs::Files(outputs.clone())
+            };
+        }
+        if let Some(depends) = &self.depends
+            && !depends.is_empty()
+        {
+            task.depends = depends.iter().cloned().map(Into::into).collect();
+        }
+        task.additional_config_sources
+            .extend(self.config_sources.iter().cloned());
+    }
+
+    pub(crate) fn apply_after_defaults(&self, task: &mut Task) {
+        if self.outputs.as_ref().is_some_and(Vec::is_empty) {
+            task.outputs = TaskOutputs::NoFiles;
+        }
+        if self.depends.as_ref().is_some_and(Vec::is_empty) {
+            task.depends.clear();
+        }
+        if let Some(enabled) = self.cache {
+            task.cache
+                .get_or_insert_with(TaskCacheConfig::default)
+                .enabled = enabled;
+        }
+    }
 }
 
 /// Explicit changes applied after workspace providers discover their projects.
@@ -234,7 +326,12 @@ impl WorkspaceProjectGraph {
                 .get_mut(&id)
                 .expect("non-removed override project exists");
             match provider.discover_project_tasks(workspace_root, project.root.as_path()) {
-                Ok(tasks) => project.tasks = tasks,
+                Ok(mut tasks) => {
+                    for task in tasks.values_mut() {
+                        attach_task_provenance(task, provider_id);
+                    }
+                    project.tasks = tasks;
+                }
                 Err(error) => {
                     warn!(
                         "failed to infer workspace tasks for {id} at {}: {error:#}",
@@ -276,6 +373,7 @@ impl WorkspaceProjectGraph {
                 };
                 validate_id_part("project", local_id)?;
                 project.root = normalize_project_root(&project.id, &project.root)?;
+                attach_provider_provenance(&mut project, &provider_id);
                 let id = project.id.clone();
                 if projects.insert(id.clone(), project).is_some() {
                     bail!(
@@ -319,25 +417,35 @@ impl WorkspaceProjectGraph {
                 let root = normalize_project_root(&id, root)?;
                 if root != project.root {
                     project.tasks.clear();
+                    for provenance in project.dependency_provenance.values_mut() {
+                        provenance.source = None;
+                    }
                     project.root = root;
                 }
+                project.provenance = WorkspaceProvenance::default();
             }
             if let Some(metadata) = &config.metadata {
                 project.metadata.clone_from(metadata);
+                project.provenance = WorkspaceProvenance::default();
             }
             if let Some(depends) = &config.depends {
                 project.dependencies = parse_dependency_ids(&id, "depends", depends)?;
+                project.dependency_provenance.clear();
             }
             let depends_remove =
                 parse_dependency_ids(&id, "depends_remove", &config.depends_remove)?;
             project
                 .dependencies
                 .retain(|dependency| !depends_remove.contains(dependency));
-            project.dependencies.extend(parse_dependency_ids(
-                &id,
-                "depends_add",
-                &config.depends_add,
-            )?);
+            project
+                .dependency_provenance
+                .retain(|dependency, _| !depends_remove.contains(dependency));
+            let depends_add = parse_dependency_ids(&id, "depends_add", &config.depends_add)?;
+            for dependency in depends_add {
+                if project.dependencies.insert(dependency.clone()) {
+                    project.dependency_provenance.remove(&dependency);
+                }
+            }
         }
 
         if !removed.is_empty() {
@@ -345,6 +453,9 @@ impl WorkspaceProjectGraph {
                 project
                     .dependencies
                     .retain(|dependency| !removed.contains(dependency));
+                project
+                    .dependency_provenance
+                    .retain(|dependency, _| !removed.contains(dependency));
             }
         }
         self.validate()?;
@@ -469,6 +580,55 @@ impl WorkspaceProjectGraph {
     }
 }
 
+fn attach_provider_provenance(project: &mut WorkspaceProject, provider: &str) {
+    project
+        .provenance
+        .provider
+        .get_or_insert_with(|| provider.to_string());
+    for dependency in &project.dependencies {
+        project
+            .dependency_provenance
+            .entry(dependency.clone())
+            .or_default()
+            .provider
+            .get_or_insert_with(|| provider.to_string());
+    }
+    for task in project.tasks.values_mut() {
+        attach_task_provenance(task, provider);
+    }
+}
+
+fn attach_task_provenance(task: &mut WorkspaceTask, provider: &str) {
+    task.provenance
+        .provider
+        .get_or_insert_with(|| provider.to_string());
+    task.provenance
+        .source
+        .get_or_insert_with(|| task.source.clone());
+    let suggestion_source = task.suggestions.config_sources.first().cloned();
+    let attach_suggestion = |provenance: &mut Option<WorkspaceProvenance>| {
+        let provenance = provenance.get_or_insert_default();
+        provenance
+            .provider
+            .get_or_insert_with(|| provider.to_string());
+        if let Some(source) = &suggestion_source {
+            provenance.source.get_or_insert_with(|| source.clone());
+        }
+    };
+    if !task.suggestions.inputs.is_empty() {
+        attach_suggestion(&mut task.suggestions.provenance.inputs);
+    }
+    if task.suggestions.outputs.is_some() {
+        attach_suggestion(&mut task.suggestions.provenance.outputs);
+    }
+    if task.suggestions.cache.is_some() {
+        attach_suggestion(&mut task.suggestions.provenance.cache);
+    }
+    if task.suggestions.depends.is_some() {
+        attach_suggestion(&mut task.suggestions.provenance.depends);
+    }
+}
+
 fn validate_override(id: &ProjectId, config: &WorkspaceProjectOverride) -> Result<()> {
     if config.remove
         && (config.root.is_some()
@@ -574,6 +734,8 @@ mod tests {
                     command: "old build".to_string(),
                     description: "old build".to_string(),
                     source: "old/manifest".into(),
+                    provenance: WorkspaceProvenance::default(),
+                    suggestions: WorkspaceTaskSuggestions::default(),
                 },
             );
             Ok(vec![project])
@@ -610,6 +772,130 @@ mod tests {
     }
 
     #[test]
+    fn task_suggestions_map_to_inferred_task_configuration() {
+        let suggestions = WorkspaceTaskSuggestions {
+            inputs: vec!["src/**".to_string(), "package.json".to_string()],
+            outputs: Some(vec!["dist/**".to_string()]),
+            cache: Some(true),
+            depends: Some(vec!["prepare".to_string(), "^build".to_string()]),
+            config_sources: vec![PathBuf::from("turbo.json")],
+            provenance: WorkspaceTaskSuggestionProvenance::default(),
+        };
+        let mut task = Task::default();
+
+        suggestions.apply_before_defaults(&mut task);
+        suggestions.apply_after_defaults(&mut task);
+
+        assert_eq!(task.sources, vec!["src/**", "package.json"]);
+        assert_eq!(
+            task.outputs,
+            TaskOutputs::Files(vec!["dist/**".to_string()])
+        );
+        assert!(task.cache.as_ref().is_some_and(|cache| cache.enabled));
+        assert_eq!(
+            task.depends
+                .iter()
+                .map(|dependency| dependency.task.as_str())
+                .collect::<Vec<_>>(),
+            vec!["prepare", "^build"]
+        );
+        assert_eq!(
+            task.additional_config_sources,
+            [PathBuf::from("turbo.json")]
+        );
+    }
+
+    #[test]
+    fn task_suggestions_distinguish_empty_values_from_no_suggestion() {
+        let mut no_outputs = Task::default();
+        let no_output_suggestions = WorkspaceTaskSuggestions {
+            outputs: Some(Vec::new()),
+            cache: Some(false),
+            ..Default::default()
+        };
+        no_output_suggestions.apply_before_defaults(&mut no_outputs);
+        no_outputs.merge_template(&super::super::TaskTemplate {
+            outputs: TaskOutputs::Files(vec!["default".to_string()]),
+            ..Default::default()
+        });
+        no_output_suggestions.apply_after_defaults(&mut no_outputs);
+        assert_eq!(no_outputs.outputs, TaskOutputs::NoFiles);
+        assert!(
+            no_outputs
+                .cache
+                .as_ref()
+                .is_some_and(|cache| !cache.enabled)
+        );
+
+        let mut unspecified = Task {
+            sources: vec!["existing".to_string()],
+            outputs: TaskOutputs::Files(vec!["existing".to_string()]),
+            cache: Some(TaskCacheConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            depends: vec!["existing".to_string().into()],
+            ..Default::default()
+        };
+        WorkspaceTaskSuggestions::default().apply_before_defaults(&mut unspecified);
+        WorkspaceTaskSuggestions::default().apply_after_defaults(&mut unspecified);
+        assert_eq!(unspecified.sources, vec!["existing"]);
+        assert_eq!(
+            unspecified.outputs,
+            TaskOutputs::Files(vec!["existing".to_string()])
+        );
+        assert_eq!(unspecified.depends[0].task, "existing");
+        assert!(
+            unspecified
+                .cache
+                .as_ref()
+                .is_some_and(|cache| cache.enabled)
+        );
+
+        let suggestions = WorkspaceTaskSuggestions {
+            depends: Some(Vec::new()),
+            ..Default::default()
+        };
+        let mut no_dependencies = Task::default();
+        suggestions.apply_before_defaults(&mut no_dependencies);
+        no_dependencies.merge_template(&super::super::TaskTemplate {
+            depends: vec!["default".to_string().into()],
+            ..Default::default()
+        });
+        suggestions.apply_after_defaults(&mut no_dependencies);
+        assert!(no_dependencies.depends.is_empty());
+    }
+
+    #[test]
+    fn cache_suggestion_preserves_default_cache_inputs() {
+        let suggestions = WorkspaceTaskSuggestions {
+            cache: Some(true),
+            ..Default::default()
+        };
+        let mut task = Task::default();
+
+        suggestions.apply_before_defaults(&mut task);
+        task.merge_template(&super::super::TaskTemplate {
+            cache: Some(TaskCacheConfig {
+                env: vec!["NODE_ENV".to_string()],
+                command_inputs: vec!["node --version".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        suggestions.apply_after_defaults(&mut task);
+
+        assert_eq!(
+            task.cache,
+            Some(TaskCacheConfig {
+                enabled: true,
+                env: vec!["NODE_ENV".to_string()],
+                command_inputs: vec!["node --version".to_string()],
+            })
+        );
+    }
+
+    #[test]
     fn discovery_is_ordered_and_normalizes_roots() {
         let provider = test_provider(vec![
             project("test", "z", "./packages/z"),
@@ -621,6 +907,7 @@ mod tests {
 
         assert_eq!(projects[0].id.as_str(), "test:a");
         assert_eq!(projects[0].root, Path::new("."));
+        assert_eq!(projects[0].provenance.provider.as_deref(), Some("test"));
         assert_eq!(projects[1].id.as_str(), "test:z");
         assert_eq!(projects[1].root, Path::new("packages/z"));
     }
@@ -765,6 +1052,8 @@ mod tests {
                 command: "npm run build --".to_string(),
                 description: "vite build".to_string(),
                 source: "apps/app/package.json".into(),
+                provenance: WorkspaceProvenance::default(),
+                suggestions: WorkspaceTaskSuggestions::default(),
             },
         );
         let node = TestProvider {
@@ -867,6 +1156,133 @@ mod tests {
                 .dependencies,
             BTreeSet::from([ProjectId::new("node", "explicit").unwrap()])
         );
+    }
+
+    #[test]
+    fn depends_add_preserves_existing_provider_provenance() {
+        let dependency_id = ProjectId::new("node", "lib").unwrap();
+        let mut app = project("node", "app", "app");
+        app.dependencies.insert(dependency_id.clone());
+        let provider = TestProvider {
+            id: "node",
+            projects: vec![app, project("node", "lib", "lib")],
+        };
+        let overrides = BTreeMap::from([(
+            "node:app".to_string(),
+            WorkspaceProjectOverride {
+                depends_add: BTreeSet::from(["node:lib".to_string()]),
+                ..Default::default()
+            },
+        )]);
+
+        let graph = WorkspaceProjectGraph::discover(&provider, Path::new("/workspace"))
+            .unwrap()
+            .with_overrides(&overrides)
+            .unwrap();
+        let app = graph.get(&ProjectId::new("node", "app").unwrap()).unwrap();
+
+        assert_eq!(
+            app.dependency_provenance[&dependency_id]
+                .provider
+                .as_deref(),
+            Some("node")
+        );
+    }
+
+    #[test]
+    fn root_overrides_clear_stale_sources_and_retain_edge_provider() {
+        let dependency_id = ProjectId::new("node", "lib").unwrap();
+        let mut app = project("node", "app", "packages/app");
+        app.dependencies.insert(dependency_id.clone());
+        app.provenance.source = Some("packages/app/package.json".into());
+        app.dependency_provenance.insert(
+            dependency_id.clone(),
+            WorkspaceProvenance {
+                source: Some("packages/app/package.json".into()),
+                ..Default::default()
+            },
+        );
+        let provider = TestProvider {
+            id: "node",
+            projects: vec![app, project("node", "lib", "packages/lib")],
+        };
+        let overrides = BTreeMap::from([(
+            "node:app".to_string(),
+            WorkspaceProjectOverride {
+                root: Some("overrides/app".into()),
+                ..Default::default()
+            },
+        )]);
+
+        let graph = WorkspaceProjectGraph::discover(&provider, Path::new("/workspace"))
+            .unwrap()
+            .with_overrides(&overrides)
+            .unwrap();
+        let app = graph.get(&ProjectId::new("node", "app").unwrap()).unwrap();
+
+        assert_eq!(app.provenance, WorkspaceProvenance::default());
+        assert_eq!(
+            app.dependency_provenance[&dependency_id]
+                .provider
+                .as_deref(),
+            Some("node")
+        );
+        assert_eq!(app.dependency_provenance[&dependency_id].source, None);
+    }
+
+    #[test]
+    fn equal_root_overrides_attribute_project_to_configuration() {
+        let dependency_id = ProjectId::new("node", "lib").unwrap();
+        let mut app = project("node", "app", "packages/app");
+        app.dependencies.insert(dependency_id.clone());
+        let provider = TestProvider {
+            id: "node",
+            projects: vec![app, project("node", "lib", "packages/lib")],
+        };
+        let overrides = BTreeMap::from([(
+            "node:app".to_string(),
+            WorkspaceProjectOverride {
+                root: Some("packages/app".into()),
+                ..Default::default()
+            },
+        )]);
+
+        let graph = WorkspaceProjectGraph::discover(&provider, Path::new("/workspace"))
+            .unwrap()
+            .with_overrides(&overrides)
+            .unwrap();
+        let app = graph.get(&ProjectId::new("node", "app").unwrap()).unwrap();
+
+        assert_eq!(app.provenance, WorkspaceProvenance::default());
+        assert_eq!(
+            app.dependency_provenance[&dependency_id]
+                .provider
+                .as_deref(),
+            Some("node")
+        );
+    }
+
+    #[test]
+    fn metadata_overrides_clear_provider_provenance() {
+        let provider = TestProvider {
+            id: "node",
+            projects: vec![project("node", "app", "packages/app")],
+        };
+        let overrides = BTreeMap::from([(
+            "node:app".to_string(),
+            WorkspaceProjectOverride {
+                metadata: Some(BTreeMap::from([("kind".to_string(), "web".to_string())])),
+                ..Default::default()
+            },
+        )]);
+
+        let graph = WorkspaceProjectGraph::discover(&provider, Path::new("/workspace"))
+            .unwrap()
+            .with_overrides(&overrides)
+            .unwrap();
+        let app = graph.get(&ProjectId::new("node", "app").unwrap()).unwrap();
+
+        assert_eq!(app.provenance, WorkspaceProvenance::default());
     }
 
     #[test]

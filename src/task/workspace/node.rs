@@ -3,11 +3,16 @@ use std::path::{Path, PathBuf};
 
 use aube::embed::{ManifestError, PackageJson, WorkspaceDiscoveryOptions};
 use eyre::{Context, Result};
+use serde::Deserialize;
 
-use super::{ProjectId, WorkspaceProject, WorkspaceProvider, WorkspaceTask};
+use super::{
+    ProjectId, WorkspaceProject, WorkspaceProvenance, WorkspaceProvider, WorkspaceTask,
+    WorkspaceTaskSuggestions,
+};
 
 const PACKAGE_JSON: &str = "package.json";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
+const TURBO_JSON: &str = "turbo.json";
 
 /// Discovers Node projects from npm, pnpm, Yarn, and Bun workspace definitions.
 #[derive(Debug, Default)]
@@ -17,6 +22,22 @@ struct WorkspaceDefinition {
     source: &'static str,
     package_manager: Option<String>,
     include_named_root: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct TurboJson {
+    tasks: BTreeMap<String, TurboTask>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct TurboTask {
+    inputs: Option<Vec<String>>,
+    outputs: Option<Vec<String>>,
+    cache: Option<bool>,
+    #[serde(rename = "dependsOn")]
+    depends_on: Option<Vec<String>>,
 }
 
 impl WorkspaceProvider for NodeWorkspaceProvider {
@@ -34,6 +55,7 @@ impl WorkspaceProvider for NodeWorkspaceProvider {
                 workspace_root.display()
             )
         })?;
+        let turbo = read_turbo_json(workspace_root)?;
         let mut roots = aube::embed::discover_workspace_packages(
             &canonical_root,
             WorkspaceDiscoveryOptions::confined_to_root(),
@@ -112,6 +134,24 @@ impl WorkspaceProvider for NodeWorkspaceProvider {
                 let source = root.join(PACKAGE_JSON);
                 let mut project = WorkspaceProject::new(id, root);
                 project.dependencies = dependencies;
+                project.provenance = WorkspaceProvenance {
+                    provider: Some("node".to_string()),
+                    source: Some(source.clone()),
+                };
+                project.dependency_provenance = project
+                    .dependencies
+                    .iter()
+                    .cloned()
+                    .map(|dependency| {
+                        (
+                            dependency,
+                            WorkspaceProvenance {
+                                provider: Some("node".to_string()),
+                                source: Some(source.clone()),
+                            },
+                        )
+                    })
+                    .collect();
                 project.metadata.insert(
                     "workspace_source".to_string(),
                     definition.source.to_string(),
@@ -122,7 +162,13 @@ impl WorkspaceProvider for NodeWorkspaceProvider {
                         .insert("package_manager".to_string(), package_manager.clone());
                 }
                 let package_manager = definition.package_manager.as_deref().unwrap_or("npm");
-                project.tasks = workspace_tasks(&manifest, package_manager, &source);
+                project.tasks = workspace_tasks(
+                    &manifest,
+                    package_manager,
+                    &source,
+                    turbo.as_ref(),
+                    workspace_root,
+                );
                 Ok(project)
             })
             .collect()
@@ -145,7 +191,14 @@ impl WorkspaceProvider for NodeWorkspaceProvider {
             return Ok(BTreeMap::new());
         };
         let package_manager = definition.package_manager.as_deref().unwrap_or("npm");
-        Ok(workspace_tasks(&manifest, package_manager, &source))
+        let turbo = read_turbo_json(workspace_root)?;
+        Ok(workspace_tasks(
+            &manifest,
+            package_manager,
+            &source,
+            turbo.as_ref(),
+            workspace_root,
+        ))
     }
 }
 
@@ -153,6 +206,8 @@ fn workspace_tasks(
     manifest: &PackageJson,
     package_manager: &str,
     source: &Path,
+    turbo: Option<&TurboJson>,
+    workspace_root: &Path,
 ) -> BTreeMap<String, WorkspaceTask> {
     manifest
         .scripts
@@ -165,10 +220,90 @@ fn workspace_tasks(
                     command,
                     description: script.clone(),
                     source: source.to_path_buf(),
+                    provenance: WorkspaceProvenance {
+                        provider: Some("node".to_string()),
+                        source: Some(source.to_path_buf()),
+                    },
+                    suggestions: turbo
+                        .and_then(|turbo| turbo.task(manifest.name.as_deref(), name))
+                        .map(|task| task.suggestions(workspace_root))
+                        .unwrap_or_default(),
                 },
             )
         })
         .collect()
+}
+
+impl TurboJson {
+    fn task(&self, package: Option<&str>, task: &str) -> Option<&TurboTask> {
+        package
+            .and_then(|package| self.tasks.get(&format!("{package}#{task}")))
+            .or_else(|| self.tasks.get(task))
+    }
+}
+
+impl TurboTask {
+    fn suggestions(&self, workspace_root: &Path) -> WorkspaceTaskSuggestions {
+        let supported_patterns = |patterns: &Option<Vec<String>>| {
+            patterns
+                .as_ref()
+                .filter(|patterns| patterns.iter().all(|pattern| !pattern.contains('$')))
+                .cloned()
+        };
+        let inputs = supported_patterns(&self.inputs)
+            .filter(|patterns| !patterns.is_empty())
+            .unwrap_or_default();
+        let outputs = supported_patterns(&self.outputs);
+        let depends = self
+            .depends_on
+            .as_ref()
+            .filter(|dependencies| {
+                dependencies.iter().all(|dependency| {
+                    let task = dependency.strip_prefix('^').unwrap_or(dependency);
+                    !task.is_empty() && !task.contains('#') && !task.contains('$')
+                })
+            })
+            .cloned();
+        let provenance = || WorkspaceProvenance {
+            provider: Some("node".to_string()),
+            source: Some(PathBuf::from(TURBO_JSON)),
+        };
+
+        WorkspaceTaskSuggestions {
+            provenance: super::WorkspaceTaskSuggestionProvenance {
+                inputs: (!inputs.is_empty()).then(provenance),
+                outputs: outputs.as_ref().map(|_| provenance()),
+                cache: self.cache.map(|_| provenance()),
+                depends: depends.as_ref().map(|_| provenance()),
+            },
+            inputs,
+            outputs,
+            cache: self.cache,
+            depends,
+            config_sources: vec![workspace_root.join(TURBO_JSON)],
+        }
+    }
+}
+
+fn read_turbo_json(workspace_root: &Path) -> Result<Option<TurboJson>> {
+    let path = workspace_root.join(TURBO_JSON);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            warn!("failed to read optional {}: {error}", path.display());
+            return Ok(None);
+        }
+    };
+    match serde_json::from_str(&contents) {
+        Ok(turbo) => Ok(Some(turbo)),
+        Err(error) => {
+            warn!("failed to parse optional {}: {error}", path.display());
+            Ok(None)
+        }
+    }
 }
 
 fn workspace_definition(workspace_root: &Path) -> Result<Option<WorkspaceDefinition>> {
@@ -307,6 +442,11 @@ mod tests {
                 command: "pnpm run build --".to_string(),
                 description: "vite build".to_string(),
                 source: PathBuf::from("packages/app/package.json"),
+                provenance: WorkspaceProvenance {
+                    provider: Some("node".to_string()),
+                    source: Some(PathBuf::from("packages/app/package.json")),
+                },
+                suggestions: WorkspaceTaskSuggestions::default(),
             })
         );
         assert_eq!(
@@ -316,6 +456,111 @@ mod tests {
                 .map(|task| task.command.as_str()),
             Some("pnpm run test:unit --")
         );
+    }
+
+    #[test]
+    fn imports_authoritative_turbo_task_suggestions() {
+        let temp = tempdir().unwrap();
+        write(
+            &temp.path().join(PACKAGE_JSON),
+            r#"{"packageManager":"pnpm@10.0.0","workspaces":["packages/*"]}"#,
+        );
+        write(
+            &temp.path().join("packages/app/package.json"),
+            r#"{"name":"@scope/app","scripts":{"build":"vite build"}}"#,
+        );
+        write(
+            &temp.path().join(TURBO_JSON),
+            r#"{
+                "tasks": {
+                    "build": {
+                        "inputs": ["src/**", "package.json"],
+                        "outputs": ["dist/**"],
+                        "cache": true,
+                        "dependsOn": ["^build", "prepare"]
+                    }
+                }
+            }"#,
+        );
+
+        let projects = NodeWorkspaceProvider.discover(temp.path()).unwrap();
+        let suggestions = &projects[0].tasks["build"].suggestions;
+
+        assert_eq!(suggestions.inputs, ["src/**", "package.json"]);
+        assert_eq!(
+            suggestions
+                .outputs
+                .as_ref()
+                .map(|outputs| outputs.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["dist/**"])
+        );
+        assert_eq!(suggestions.cache, Some(true));
+        assert_eq!(
+            suggestions
+                .depends
+                .as_ref()
+                .map(|depends| { depends.iter().map(String::as_str).collect::<Vec<_>>() }),
+            Some(vec!["^build", "prepare"])
+        );
+        assert_eq!(suggestions.config_sources, [temp.path().join(TURBO_JSON)]);
+        assert_eq!(
+            suggestions.provenance.inputs,
+            Some(WorkspaceProvenance {
+                provider: Some("node".to_string()),
+                source: Some(PathBuf::from(TURBO_JSON)),
+            })
+        );
+        assert_eq!(
+            suggestions.provenance.outputs,
+            suggestions.provenance.inputs
+        );
+        assert_eq!(suggestions.provenance.cache, suggestions.provenance.inputs);
+        assert_eq!(
+            suggestions.provenance.depends,
+            suggestions.provenance.inputs
+        );
+    }
+
+    #[test]
+    fn invalid_turbo_json_does_not_remove_package_scripts() {
+        for contents in ["{", r#"{"tasks":{"build":{"cache":"yes"}}}"#] {
+            let temp = tempdir().unwrap();
+            write(
+                &temp.path().join(PACKAGE_JSON),
+                r#"{"packageManager":"pnpm@10.0.0","workspaces":["packages/*"]}"#,
+            );
+            write(
+                &temp.path().join("packages/app/package.json"),
+                r#"{"name":"app","scripts":{"build":"vite build"}}"#,
+            );
+            write(&temp.path().join(TURBO_JSON), contents);
+
+            let projects = NodeWorkspaceProvider.discover(temp.path()).unwrap();
+            let task = &projects[0].tasks["build"];
+
+            assert_eq!(task.command, "pnpm run build --");
+            assert_eq!(task.suggestions, WorkspaceTaskSuggestions::default());
+        }
+    }
+
+    #[test]
+    fn leaves_unsupported_turbo_suggestion_fields_unset() {
+        let task: TurboTask = serde_json::from_str(
+            r#"{
+                "inputs": ["$TURBO_DEFAULT$", "src/**"],
+                "outputs": ["$TURBO_ROOT$/dist/**"],
+                "dependsOn": ["other-package#build"],
+                "cache": false
+            }"#,
+        )
+        .unwrap();
+
+        let suggestions = task.suggestions(Path::new("/workspace"));
+
+        assert!(suggestions.inputs.is_empty());
+        assert!(suggestions.outputs.is_none());
+        assert!(suggestions.depends.is_none());
+        assert_eq!(suggestions.cache, Some(false));
     }
 
     #[test]
@@ -350,6 +595,7 @@ mod tests {
         let project = graph.get(&ProjectId::new("node", "app").unwrap()).unwrap();
 
         assert_eq!(project.root, Path::new("overrides/app"));
+        assert_eq!(project.provenance, WorkspaceProvenance::default());
         assert!(!project.tasks.contains_key("old"));
         assert_eq!(
             project.tasks.get("new"),
@@ -357,6 +603,11 @@ mod tests {
                 command: "pnpm run new --".to_string(),
                 description: "new command".to_string(),
                 source: PathBuf::from("overrides/app/package.json"),
+                provenance: WorkspaceProvenance {
+                    provider: Some("node".to_string()),
+                    source: Some(PathBuf::from("overrides/app/package.json")),
+                },
+                suggestions: WorkspaceTaskSuggestions::default(),
             })
         );
     }
@@ -728,6 +979,20 @@ mod tests {
                 ProjectId::new("node", "runtime").unwrap(),
             ])
         );
+        assert_eq!(
+            app.provenance,
+            WorkspaceProvenance {
+                provider: Some("node".to_string()),
+                source: Some(PathBuf::from("packages/app/package.json")),
+            }
+        );
+        assert!(app.dependencies.iter().all(|dependency| {
+            app.dependency_provenance.get(dependency)
+                == Some(&WorkspaceProvenance {
+                    provider: Some("node".to_string()),
+                    source: Some(PathBuf::from("packages/app/package.json")),
+                })
+        }));
     }
 
     #[test]
