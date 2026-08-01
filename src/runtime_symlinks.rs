@@ -14,7 +14,15 @@ use itertools::Itertools;
 use versions::Versioning;
 
 pub async fn rebuild_for_toolset(config: &Config, ts: &Toolset) -> Result<()> {
-    for backend in ts.list_cached_and_current_backends() {
+    rebuild_for_backends(config, ts, ts.list_cached_and_current_backends()).await
+}
+
+pub(crate) async fn rebuild_for_backends(
+    config: &Config,
+    ts: &Toolset,
+    backends: impl IntoIterator<Item = Arc<dyn Backend>>,
+) -> Result<()> {
+    for backend in backends {
         for installs_dir in install_dirs_for(&backend) {
             rebuild_symlinks_in_dir(config, ts, &backend, &installs_dir)?;
         }

@@ -21,7 +21,7 @@ use crate::toolset::tool_request::ToolRequest;
 use crate::toolset::tool_source::ToolSource;
 use crate::toolset::tool_version::{ResolveOptions, ToolVersion};
 use crate::ui::multi_progress_report::MultiProgressReport;
-use crate::{backend, config, hooks};
+use crate::{backend, config, hooks, runtime_symlinks};
 
 impl Toolset {
     #[async_backtrace::framed]
@@ -165,6 +165,11 @@ impl Toolset {
 
         // Build dependency graph and install using Kahn's algorithm
         let (installed, failed) = self.install_with_deps(config, versions, opts).await;
+        let failed_backends = failed
+            .iter()
+            .filter_map(|(tr, _)| tr.backend().ok())
+            .unique_by(|backend| backend.ba().installs_path.clone())
+            .collect_vec();
 
         // Update footer for errors found before install tasks are spawned.
         let pre_install_error_count = disabled_backend_errors.len() + plugin_errors.len();
@@ -185,6 +190,12 @@ impl Toolset {
             trace!("install: resolving");
             if let Err(err) = self.resolve(config).await {
                 debug!("error resolving versions after install: {err:#}");
+            }
+            if !failed_backends.is_empty()
+                && let Err(err) =
+                    runtime_symlinks::rebuild_for_backends(config, self, failed_backends).await
+            {
+                warn!("failed to restore runtime symlinks after install failure: {err:#}");
             }
         }
 
