@@ -52,6 +52,10 @@ depends_post = ["cleanup", "notify"]
 run = "kubectl apply -f deployment.yaml"
 ```
 
+Regular dependencies of cleanup tasks are part of the post phase as well, and do not start until
+the parent task has completed. A task used in both a regular and post dependency is a separate
+execution occurrence in each phase.
+
 #### `wait_for` - Soft Dependencies
 
 Tasks that should run first if they're in the current execution, but don't fail if they're not available:
