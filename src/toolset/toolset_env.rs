@@ -232,6 +232,8 @@ impl Toolset {
             .filter(|(k, _)| k.as_str() != PATH_KEY.as_str())
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let get_env_vars = crate::tera::tera_accessed_env_vars();
+        let get_env_hash = crate::tera::tera_env_vars_hash(&get_env_vars, &env::PRISTINE_ENV);
 
         let cached = CachedEnv {
             env: env_without_path,
@@ -240,6 +242,8 @@ impl Toolset {
             created_at: now,
             watch_files,
             watch_file_mtimes,
+            get_env_vars,
+            get_env_hash,
             mise_version: env!("CARGO_PKG_VERSION").to_string(),
             cache_key_debug: cache_key.clone(),
         };

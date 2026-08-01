@@ -31,7 +31,10 @@ use crate::shorthands::{Shorthands, get_shorthands};
 use crate::task::task_file_providers::TaskFileProvidersBuilder;
 use crate::task::task_sources::TaskOutputs;
 use crate::task::{RunEntry, Task, TaskCacheConfig, TaskTemplate, monorepo_scope, strip_extension};
-use crate::tera::{contains_template_syntax, get_empty_tera, render_str, take_tera_accessed_files};
+use crate::tera::{
+    clear_tera_accessed_env_vars, contains_template_syntax, get_empty_tera, render_str,
+    take_tera_accessed_files, tera_accessed_env_vars, tera_env_vars_hash,
+};
 use crate::toolset::env_cache::{CachedNonToolEnv, compute_settings_hash, get_file_mtime};
 use crate::toolset::{
     ResolvedToolOptions, ToolOptionSource, ToolOptions, ToolRequestSet, ToolRequestSetBuilder,
@@ -166,6 +169,7 @@ impl Config {
 
     #[async_backtrace::framed]
     pub async fn load() -> Result<Arc<Self>> {
+        clear_tera_accessed_env_vars();
         backend::load_tools().await?;
         let idiomatic_files = measure!("config::load idiomatic_files", {
             load_idiomatic_filenames().await
@@ -1079,6 +1083,8 @@ impl Config {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
+            let get_env_vars = tera_accessed_env_vars();
+            let get_env_hash = tera_env_vars_hash(&get_env_vars, &env::PRISTINE_ENV);
             let cached = CachedNonToolEnv {
                 env: env_results.env.clone(),
                 env_remove: env_results.env_remove.clone(),
@@ -1089,6 +1095,8 @@ impl Config {
                 redaction_exclusions: env_results.redaction_exclusions.clone(),
                 watch_files,
                 watch_file_mtimes,
+                get_env_vars,
+                get_env_hash,
                 created_at: now,
                 mise_version: env!("CARGO_PKG_VERSION").to_string(),
                 cache_key_debug: cache_key.clone(),

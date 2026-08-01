@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::iter::once;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -27,6 +27,11 @@ use crate::{dirs, duration, env, hash};
 /// push paths here so that hook-env can watch them for changes.
 static TERA_ACCESSED_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+/// Environment variables read through `get_env()` while rendering config templates.
+/// Names are tracked so hook-env and the env cache can invalidate only the inputs
+/// that actually affect rendered config. Values are never stored here.
+static TERA_ACCESSED_ENV_VARS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
 fn track_tera_file(path: &Path) {
     if let Ok(mut files) = TERA_ACCESSED_FILES.lock() {
         files.push(path.to_path_buf());
@@ -42,6 +47,50 @@ pub fn take_tera_accessed_files() -> Vec<PathBuf> {
     files.sort();
     files.dedup();
     files
+}
+
+fn track_tera_env_var(name: &str) {
+    if let Ok(mut vars) = TERA_ACCESSED_ENV_VARS.lock() {
+        vars.insert(name.to_string());
+    }
+}
+
+/// Clear environment dependencies before loading a new config.
+pub fn clear_tera_accessed_env_vars() {
+    if let Ok(mut vars) = TERA_ACCESSED_ENV_VARS.lock() {
+        vars.clear();
+    }
+}
+
+/// Return the currently tracked `get_env()` inputs in deterministic order.
+pub fn tera_accessed_env_vars() -> Vec<String> {
+    TERA_ACCESSED_ENV_VARS
+        .lock()
+        .map(|vars| vars.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Restore dependencies when a rendered environment is loaded from cache.
+pub fn track_tera_env_vars(vars: impl IntoIterator<Item = String>) {
+    if let Ok(mut tracked) = TERA_ACCESSED_ENV_VARS.lock() {
+        tracked.extend(vars);
+    }
+}
+
+/// Hash the current values of tracked `get_env()` inputs without persisting
+/// their values. Missing and empty values remain distinct in the serialized
+/// hash input.
+pub fn tera_env_vars_hash(vars: &[String], env: &EnvMap) -> String {
+    let mut vars = vars.to_vec();
+    vars.sort();
+    vars.dedup();
+    let values = vars
+        .iter()
+        .map(|name| (name.as_str(), env.get(name).map(String::as_str)))
+        .collect::<Vec<_>>();
+    hash::hash_blake3_to_str(
+        &serde_json::to_string(&values).expect("get_env dependency values are serializable"),
+    )
 }
 
 /// Fast marker check for Tera 1.x syntax.
@@ -892,6 +941,7 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
 fn tera_get_env(env: EnvMap) -> impl Fn(Kwargs, &State) -> TeraResult<Value> {
     move |args: Kwargs, _: &State| -> TeraResult<Value> {
         let name = args.must_get::<&str>("name")?;
+        track_tera_env_var(name);
         if let Some(value) = env.get(name) {
             return Ok(Value::from(value.clone()));
         }
@@ -1795,6 +1845,28 @@ mod tests {
             tera.render_str("{{ get_env(name='MISE_TEST_MISSING_ENV') }}", &ctx, false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn get_env_dependency_hash_is_deterministic_and_value_sensitive() {
+        let vars = vec!["SECOND".to_string(), "FIRST".to_string()];
+        let reordered = vec!["FIRST".to_string(), "SECOND".to_string()];
+        let env = EnvMap::from([
+            ("FIRST".to_string(), "value".to_string()),
+            ("SECOND".to_string(), String::new()),
+        ]);
+
+        let hash = tera_env_vars_hash(&vars, &env);
+        assert_eq!(hash, tera_env_vars_hash(&reordered, &env));
+
+        let changed = EnvMap::from([
+            ("FIRST".to_string(), "changed".to_string()),
+            ("SECOND".to_string(), String::new()),
+        ]);
+        assert_ne!(hash, tera_env_vars_hash(&vars, &changed));
+
+        let missing = EnvMap::from([("FIRST".to_string(), "value".to_string())]);
+        assert_ne!(hash, tera_env_vars_hash(&vars, &missing));
     }
 
     #[tokio::test]

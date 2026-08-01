@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export TRACKED_INPUT=first
+export DIRECT_INPUT=direct-first
+
+cat >mise.toml <<'EOF'
+[vars]
+from_input = "{{ get_env(name='TRACKED_INPUT', default='fallback') }}"
+
+[env]
+TRACKED_VALUE = "{{ vars.from_input }}"
+DIRECT_VALUE = "{{ get_env(name='DIRECT_INPUT', default='direct-fallback') }}"
+
+[settings]
+env_cache = true
+hook_env.cache_ttl = "1h"
+hook_env.chpwd_only = true
+EOF
+
+eval "$(mise activate bash)"
+assert "printf '%s' \"$TRACKED_VALUE\"" "first"
+assert "printf '%s' \"$DIRECT_VALUE\"" "direct-first"
+assert_directory_exists "$HOME/.local/state/mise/env-cache"
+
+# A get_env() input used indirectly through [vars] invalidates both hook-env's
+# fast path and the rendered environment cache.
+export TRACKED_INPUT=second
+output=$(mise hook-env -s bash --reason precmd)
+[[ $output == *"export TRACKED_VALUE=second"* ]] ||
+  fail "changed get_env input was not rendered: $output"
+eval "$output"
+assert "printf '%s' \"$TRACKED_VALUE\"" "second"
+
+# Direct use in [env] is tracked as well, including the transition to missing.
+export DIRECT_INPUT=direct-second
+output=$(mise hook-env -s bash --reason precmd)
+[[ $output == *"export DIRECT_VALUE=direct-second"* ]] ||
+  fail "changed direct get_env input was not rendered: $output"
+eval "$output"
+
+unset DIRECT_INPUT
+output=$(mise hook-env -s bash --reason precmd)
+[[ $output == *"export DIRECT_VALUE=direct-fallback"* ]] ||
+  fail "unset get_env input did not use its default: $output"
+eval "$output"
+assert "printf '%s' \"$DIRECT_VALUE\"" "direct-fallback"
+
+# Environment variables that no rendered get_env() call referenced do not
+# invalidate the prompt fast path.
+export UNRELATED_INPUT=changed
+output=$(mise hook-env -s bash --reason precmd)
+assert "printf '%s' \"$output\"" ""
