@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::backend::pipx::PIPXBackend;
@@ -23,6 +24,7 @@ use crate::{config, exit, runtime_symlinks, ui};
 use console::Term;
 use demand::DemandOption;
 use eyre::{Context, Result, eyre};
+use indexmap::IndexMap;
 use jiff::{Span, Timestamp, civil::date};
 
 /// Upgrades outdated tools
@@ -198,27 +200,45 @@ impl Upgrade {
             .build(config)
             .await?;
 
-        let mut outdated_with_config_files: Vec<(&OutdatedInfo, Arc<dyn config_file::ConfigFile>)> =
-            vec![];
+        let mut parsed_config_files: IndexMap<PathBuf, Arc<dyn config_file::ConfigFile>> =
+            IndexMap::new();
+        let mut failed_config_files = HashSet::new();
+        let mut outdated_with_config_files = vec![];
         for o in outdated.iter() {
             if let (Some(path), Some(_bump)) = (o.source.path(), &o.bump) {
-                match config_file::parse(path).await {
-                    Ok(cf) => outdated_with_config_files.push((o, cf)),
-                    Err(e) => warn!("failed to parse {}: {e}", display_path(path)),
+                let cf = if let Some(cf) = parsed_config_files.get(path) {
+                    Some(Arc::clone(cf))
+                } else if failed_config_files.contains(path) {
+                    None
+                } else {
+                    match config_file::parse(path).await {
+                        Ok(cf) => {
+                            parsed_config_files.insert(path.to_path_buf(), Arc::clone(&cf));
+                            Some(cf)
+                        }
+                        Err(e) => {
+                            warn!("failed to parse {}: {e}", display_path(path));
+                            failed_config_files.insert(path.to_path_buf());
+                            None
+                        }
+                    }
+                };
+                if let Some(cf) = cf {
+                    outdated_with_config_files.push((o, cf));
                 }
             }
         }
         let config_file_updates = outdated_with_config_files
             .iter()
-            .filter(|(o, cf)| {
+            .filter_map(|(o, cf)| {
                 if let Ok(trs) = cf.to_tool_request_set()
                     && let Some(versions) = trs.tools.get(o.tool_request.ba())
                     && versions.len() != 1
                 {
                     warn!("upgrading multiple versions with --bump is not yet supported");
-                    return false;
+                    return None;
                 }
-                true
+                Some((*o, Arc::clone(cf)))
             })
             .collect::<Vec<_>>();
 
@@ -312,6 +332,7 @@ impl Upgrade {
             split_install_result(ts.install_all_versions(config, tool_requests, &opts).await);
 
         // Only update config files for tools that were successfully installed
+        let mut config_files_to_save = IndexMap::new();
         for (o, cf) in config_file_updates {
             if successful_versions
                 .iter()
@@ -322,10 +343,18 @@ impl Upgrade {
                 {
                     return Err(eyre!("Failed to update config for {}: {}", o.name, e));
                 }
-
-                if let Err(e) = cf.save() {
-                    return Err(eyre!("Failed to save config for {}: {}", o.name, e));
-                }
+                config_files_to_save
+                    .entry(cf.get_path().to_path_buf())
+                    .or_insert(cf);
+            }
+        }
+        for (path, cf) in config_files_to_save {
+            if let Err(e) = cf.save() {
+                return Err(eyre!(
+                    "Failed to save config {}: {}",
+                    display_path(&path),
+                    e
+                ));
             }
         }
 
