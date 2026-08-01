@@ -81,6 +81,7 @@ impl TaskCacheMode {
 struct CacheKeyMaterial<'a> {
     format: u8,
     task: &'a str,
+    phase: crate::task::TaskRunPhase,
     run: &'a [RunEntry],
     args: &'a [String],
     shell: &'a Option<String>,
@@ -216,6 +217,7 @@ impl TaskArtifactCacheBuilder {
         let material = CacheKeyMaterial {
             format: CACHE_FORMAT_VERSION,
             task: &task.name,
+            phase: task.run_phase,
             run: task.run(),
             args: &task.args,
             shell: &task.shell,
@@ -233,9 +235,10 @@ impl TaskArtifactCacheBuilder {
         let encoded = serde_json::to_vec(&material)?;
         let key = hash::hash_blake3_to_str(std::str::from_utf8(&encoded)?);
         let state_identity = hash::hash_blake3_to_str(&format!(
-            "{}\0{}\0{}",
+            "{}\0{}\0{:?}\0{}",
             root.display(),
             task.name,
+            task.run_phase,
             task.config_source.display()
         ));
         let state_path = dirs::STATE
