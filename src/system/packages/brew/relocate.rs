@@ -6,12 +6,13 @@
 //!   @@HOMEBREW_PREFIX@@ (19) -> /opt/homebrew (13)
 //!   @@HOMEBREW_CELLAR@@ (19) -> /opt/homebrew/Cellar (20)
 //!
-//! Text files get plain string replacement. Mach-O binaries get in-place
-//! C-string replacement: the new string must fit in the existing string's
-//! slot (its bytes plus any trailing NUL padding, keeping one terminator).
-//! Replacements that shrink always fit; the +1-byte Cellar case fits unless
-//! the original string ended exactly at its slot boundary, which we detect
-//! and report as an error rather than corrupt the binary.
+//! Text files and shebang executables get plain string replacement. The latter
+//! includes zipapps, which contain NUL bytes after their text shebang. Mach-O
+//! binaries get in-place C-string replacement: the new string must fit in the
+//! existing string's slot (its bytes plus any trailing NUL padding, keeping one
+//! terminator). Replacements that shrink always fit; the +1-byte Cellar case
+//! fits unless the original string ended exactly at its slot boundary, which
+//! we detect and report as an error rather than corrupt the binary.
 
 use std::path::{Path, PathBuf};
 
@@ -83,6 +84,15 @@ fn is_macho(content: &[u8]) -> bool {
         u32::from_be_bytes([content[0], content[1], content[2], content[3]]),
         0xfeedface | 0xcefaedfe | 0xfeedfacf | 0xcffaedfe | 0xcafebabe | 0xbebafeca
     )
+}
+
+/// Homebrew treats any file beginning with a non-empty shebang as a text
+/// executable, even when the rest of the file contains binary data (zipapps).
+fn is_text_executable(content: &[u8]) -> bool {
+    content
+        .get(..1024.min(content.len()))
+        .and_then(|prefix| prefix.strip_prefix(b"#!"))
+        .is_some_and(|rest| rest.iter().any(|b| !b.is_ascii_whitespace()))
 }
 
 fn contains_any_placeholder(content: &[u8], replacements: &[Replacement]) -> bool {
@@ -193,12 +203,13 @@ pub fn relocate_keg(keg: &Path, formula_name: &str) -> Result<RelocationReport> 
         std::fs::set_permissions(path, writable)?;
         let macho = is_macho(&content);
         let elf = cfg!(target_os = "linux") && super::elf::is_elf(&content);
-        if macho || (!elf && content.contains(&0)) {
-            // any file containing NUL bytes is treated as binary: in-place
-            // replacement that can't shift offsets. Mach-O load commands
+        if macho || (!elf && content.contains(&0) && !is_text_executable(&content)) {
+            // Non-ELF files containing NUL bytes are treated as binaries unless
+            // their shebang makes them text executables (for example zipapps).
+            // Binary replacement cannot shift offsets. Mach-O load commands
             // first: proper rewriting that can grow a command when the
             // replacement is longer; then the generic in-place pass for
-            // strings in data sections
+            // strings in data sections.
             let mut content = content;
             let mut changed = macho && super::macho::patch(&mut content, &replacements, path)?;
             changed |= replace_in_binary(&mut content, &replacements, path)?;
@@ -265,6 +276,7 @@ pub fn codesign(files: &[PathBuf]) -> Result<()> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use std::io::{Cursor, Read, Write};
 
     /// fixed macOS-style replacements so tests behave the same on all hosts
     pub(in super::super) fn test_replacements() -> Vec<Replacement> {
@@ -289,6 +301,49 @@ pub(super) mod tests {
             String::from_utf8_lossy(&out),
             "#!/opt/homebrew/bin/bash\nCELLAR=/opt/homebrew/Cellar/foo\n"
         );
+    }
+
+    #[test]
+    fn test_replace_text_executable_zipapp_with_long_prefix() {
+        let shebang = b"#!@@HOMEBREW_PREFIX@@/opt/python@3.14/bin/python3.14\n";
+        let mut cursor = Cursor::new(shebang.to_vec());
+        cursor.set_position(shebang.len() as u64);
+        let mut writer = zip::ZipWriter::new(cursor);
+        writer
+            .start_file("__main__.py", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"print('watchman-diag')\n").unwrap();
+        let content = writer.finish().unwrap().into_inner();
+
+        assert!(content.contains(&0));
+        assert!(is_text_executable(&content));
+
+        let replacements = vec![Replacement {
+            placeholder: b"@@HOMEBREW_PREFIX@@",
+            value: b"/home/linuxbrew/.linuxbrew".to_vec(),
+        }];
+        let relocated = replace_text(&content, &replacements);
+        assert!(
+            relocated.starts_with(b"#!/home/linuxbrew/.linuxbrew/opt/python@3.14/bin/python3.14\n")
+        );
+        assert_eq!(relocated.len(), content.len() + 7);
+
+        let mut archive = zip::ZipArchive::new(Cursor::new(relocated)).unwrap();
+        let mut script = String::new();
+        archive
+            .by_name("__main__.py")
+            .unwrap()
+            .read_to_string(&mut script)
+            .unwrap();
+        assert_eq!(script, "print('watchman-diag')\n");
+    }
+
+    #[test]
+    fn test_text_executable_requires_shebang_interpreter() {
+        assert!(is_text_executable(b"#!/bin/sh\n\0payload"));
+        assert!(is_text_executable(b"#!  /usr/bin/env python\n"));
+        assert!(!is_text_executable(b"plain text\n"));
+        assert!(!is_text_executable(b"#!   \t"));
     }
 
     #[test]
