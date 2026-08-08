@@ -28,6 +28,7 @@ name = "vfox-cli"
 path = "src/bin.rs"
 
 [dependencies]
+glob = "0.3"
 homedir = "0.3"
 indexmap = { version = "2", features = ["serde"] }
 itertools = "0.15"
@@ -47,7 +48,13 @@ serde = "1"
 serde_json = "1"
 toml = "1.0"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "fs", "io-util", "time"] }
+tokio = { version = "1", features = [
+  "macros",
+  "fs",
+  "io-util",
+  "sync",
+  "time",
+] }
 url = "2"
 xx = { version = "2", default-features = false, features = [
   "archive",

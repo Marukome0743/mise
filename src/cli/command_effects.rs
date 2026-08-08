@@ -43,8 +43,29 @@ pub const EFFECTS: &[(&str, SpecCommandEffect)] = &[
     ("backends", Read),
     ("backends ls", Read),
     ("bin-paths", Read),
-    ("bootstrap", Write),
+    ("bootstrap", Destructive),
+    ("bootstrap __apply-account-plan", Destructive),
+    ("bootstrap __apply-firewall-plan", Destructive),
+    ("bootstrap __apply-service-plan", Destructive),
+    ("bootstrap __apply-system-plan", Destructive),
+    ("bootstrap __inspect-firewall-plan", Read),
+    ("bootstrap __inspect-system-files", Read),
+    ("bootstrap accounts", Read),
+    ("bootstrap accounts apply", Destructive),
+    ("bootstrap accounts status", Read),
+    ("bootstrap compose", Read),
+    ("bootstrap compose apply", Destructive),
+    ("bootstrap compose status", Read),
     ("bootstrap dotfiles", Read),
+    ("bootstrap files", Read),
+    ("bootstrap files apply", Destructive),
+    ("bootstrap files status", Read),
+    ("bootstrap firewall", Read),
+    ("bootstrap firewall apply", Destructive),
+    ("bootstrap firewall status", Read),
+    ("bootstrap services", Read),
+    ("bootstrap services apply", Destructive),
+    ("bootstrap services status", Read),
     // Hidden compatibility spellings of the nested macos/linux subcommands.
     ("bootstrap launchd", Read),
     ("bootstrap launchd apply", Write),
@@ -82,13 +103,19 @@ pub const EFFECTS: &[(&str, SpecCommandEffect)] = &[
     ("bootstrap packages status", Read),
     ("bootstrap packages upgrade", Write),
     ("bootstrap packages use", Write),
+    ("bootstrap plan", Read),
     ("bootstrap plugins", Read),
     ("bootstrap plugins apply", Write),
     ("bootstrap plugins status", Read),
+    // Runs the configured bootstrap, including destructive resource states and
+    // arbitrary project hooks/tasks, on another machine.
+    ("bootstrap remote", Destructive),
     ("bootstrap repos", Read),
     ("bootstrap repos apply", Write),
     ("bootstrap repos status", Read),
     ("bootstrap repos update", Write),
+    ("bootstrap secrets", Read),
+    ("bootstrap secrets status", Read),
     ("bootstrap status", Read),
     // Changes the current user's login shell.
     ("bootstrap user", Read),
@@ -311,7 +338,10 @@ mod tests {
     /// still runnable, and `bootstrap launchd`/`systemd`/`macos-defaults` are
     /// hidden compatibility spellings of commands that change system state.
     fn all_commands() -> Vec<String> {
-        let spec: usage::Spec = crate::cli::Cli::command().into();
+        let command = crate::cli::expand_deferred_subcommands(
+            crate::cli::Cli::command().disable_help_subcommand(true),
+        );
+        let spec: usage::Spec = command.into();
         let mut out = vec![];
         collect(&spec.cmd, &mut vec![], &mut out);
         out
@@ -331,7 +361,10 @@ mod tests {
     /// actually transfers them.
     #[test]
     fn apply_annotates_the_spec() {
-        let mut spec: usage::Spec = crate::cli::Cli::command().into();
+        let command = crate::cli::expand_deferred_subcommands(
+            crate::cli::Cli::command().disable_help_subcommand(true),
+        );
+        let mut spec: usage::Spec = command.into();
         apply(&mut spec);
 
         let cmd = |name: &str| {

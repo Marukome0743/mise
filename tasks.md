@@ -106,9 +106,17 @@ Lint HK files
 
 - **Usage**: `perf`
 
+## `perf:cache-shim`
+
+- **Usage**: `perf:cache-shim`
+
 ## `perf:record`
 
 - **Usage**: `perf:record`
+
+## `perf:task-cache`
+
+- **Usage**: `perf:task-cache`
 
 ## `pre-commit`
 

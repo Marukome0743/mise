@@ -946,6 +946,10 @@ impl ConfigFile for MiseToml {
         self.min_version.as_ref()
     }
 
+    fn settings(&self) -> Option<&SettingsPartial> {
+        Some(&self.settings)
+    }
+
     fn plugins(&self) -> eyre::Result<HashMap<String, String>> {
         self.plugins
             .clone()
@@ -1037,6 +1041,12 @@ impl ConfigFile for MiseToml {
             .iter()
             .map(|tr| MiseTomlTool::from(tr.clone()))
             .collect();
+        if is_tools_sorted {
+            // Keep the parsed representation in sync with the document ordering. Sorting only the
+            // document leaves this map in insertion order, so a later replacement in the same
+            // `mise use` command can mistake an originally sorted table for an unsorted one.
+            tools.sort_keys();
+        }
         trace!("done replacing versions");
         let mut doc = self.doc_mut()?;
         trace!("got doc");
@@ -3614,6 +3624,29 @@ run = 'echo "template"'
     }
 
     #[tokio::test]
+    async fn test_replace_versions_keeps_sorted_across_multiple_updates() {
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".multiple-tool-sort.mise.toml");
+        file::write(&p, "[tools]\ntiny-ref = \"1\"\n").unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+
+        for tool in ["dummy", "tiny-local", "tiny"] {
+            let ba = BackendArg::from(tool);
+            cf.replace_versions(
+                &ba,
+                vec![ToolRequest::new(Arc::new(ba.clone()), "1", ToolSource::Unknown).unwrap()],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            cf.dump().unwrap(),
+            "[tools]\ndummy = \"1\"\ntiny = \"1\"\ntiny-local = \"1\"\ntiny-ref = \"1\"\n"
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
     async fn test_remove_plugin() {
         let _config = Config::get().await.unwrap();
         let p = PathBuf::from("/tmp/.mise.toml");
@@ -4770,6 +4803,59 @@ run = 'echo "template"'
         assert_eq!(timer.accuracy_sec.as_deref(), Some("1s"));
         assert_eq!(timer.persistent, Some(true));
         assert_eq!(timer.unit.as_deref(), Some("dev.mise.my-sync.service"));
+        file::remove_file(&p).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_bootstrap_linux_firewall() {
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".test-firewall.mise.toml");
+        file::write(
+            &p,
+            r#"
+        [bootstrap.linux.firewall]
+        backend = "nftables"
+        state = "enabled"
+        default_incoming = "deny"
+        default_outgoing = "allow"
+        exclusive = false
+
+        [[bootstrap.linux.firewall.rules]]
+        name = "https"
+        port = 443
+        protocol = "tcp"
+        action = "allow"
+
+        [[bootstrap.linux.firewall.rules]]
+        name = "admin"
+        port = "2200-2205"
+        protocol = "tcp"
+        source = "203.0.113.0/24"
+        interface = "eth0"
+        action = "allow"
+        "#,
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let firewall = cf.bootstrap_config().unwrap().linux.firewall.unwrap();
+        assert_eq!(
+            firewall.backend,
+            Some(crate::system::firewall::FirewallBackend::Nftables)
+        );
+        assert_eq!(firewall.rules.len(), 2);
+        assert_eq!(firewall.rules[0].name, "https");
+        assert!(matches!(
+            firewall.rules[0].port,
+            Some(crate::system::firewall::FirewallPortToml::Single(443))
+        ));
+        assert!(matches!(
+            firewall.rules[1].port,
+            Some(crate::system::firewall::FirewallPortToml::Range(ref range))
+                if range == "2200-2205"
+        ));
+        assert_eq!(firewall.rules[1].source.as_deref(), Some("203.0.113.0/24"));
+        assert_eq!(firewall.rules[1].interface.as_deref(), Some("eth0"));
         file::remove_file(&p).unwrap();
     }
 }

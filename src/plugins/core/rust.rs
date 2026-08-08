@@ -292,11 +292,14 @@ impl Backend for RustPlugin {
         let versions: Vec<VersionInfo> = github::list_releases("rust-lang/rust")
             .await?
             .into_iter()
-            .map(|r| VersionInfo {
-                release_url: Some(format!("https://releases.rs/docs/{}/", r.tag_name)),
-                version: r.tag_name,
-                created_at: Some(r.created_at),
-                ..Default::default()
+            .map(|r| {
+                let created_at = Some(r.released_at().to_string());
+                VersionInfo {
+                    release_url: Some(format!("https://releases.rs/docs/{}/", r.tag_name)),
+                    version: r.tag_name,
+                    created_at,
+                    ..Default::default()
+                }
             })
             .rev()
             .chain(vec![
@@ -573,28 +576,29 @@ fn rustup_path() -> PathBuf {
 }
 
 fn rustup_home() -> PathBuf {
-    let path = Settings::get()
-        .rust
-        .rustup_home
-        .clone()
-        .or(env::var_path("RUSTUP_HOME"))
-        .unwrap_or(dirs::HOME.join(".rustup"));
-    if path.is_relative() {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(&path))
-            .unwrap_or(path)
-    } else {
-        path
-    }
+    resolve_rust_home(
+        Settings::get()
+            .rust
+            .rustup_home
+            .clone()
+            .or(env::var_path("RUSTUP_HOME"))
+            .unwrap_or(dirs::HOME.join(".rustup")),
+    )
 }
 
 fn cargo_home() -> PathBuf {
-    let path = Settings::get()
-        .rust
-        .cargo_home
-        .clone()
-        .or(env::var_path("CARGO_HOME"))
-        .unwrap_or(dirs::HOME.join(".cargo"));
+    resolve_rust_home(
+        Settings::get()
+            .rust
+            .cargo_home
+            .clone()
+            .or(env::var_path("CARGO_HOME"))
+            .unwrap_or(dirs::HOME.join(".cargo")),
+    )
+}
+
+fn resolve_rust_home(path: PathBuf) -> PathBuf {
+    let path = file::replace_path(path);
     if path.is_relative() {
         std::env::current_dir()
             .map(|cwd| cwd.join(&path))
@@ -866,5 +870,17 @@ targets = ["wasm32-wasip1", " wasm32-wasip1 "]
         let opts = opts_with("profile", "");
 
         assert_eq!(RustOptions::new(&opts).lockfile_options(), BTreeMap::new());
+    }
+
+    #[test]
+    fn rust_home_paths_expand_tilde() {
+        assert_eq!(
+            resolve_rust_home(PathBuf::from("~/.cargo-custom")),
+            dirs::HOME.join(".cargo-custom")
+        );
+        assert_eq!(
+            resolve_rust_home(PathBuf::from("~/.rustup-custom")),
+            dirs::HOME.join(".rustup-custom")
+        );
     }
 }

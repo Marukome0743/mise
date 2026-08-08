@@ -552,8 +552,8 @@ outputs = { auto = true } # this is the default when sources is defined
 
 ### `cache` <Badge type="warning" text="experimental" />
 
-- **Type**: `{ enabled = bool, env = string[], command_inputs = string[] }`
-- **Default**: `{ enabled = false, env = [], command_inputs = [] }`
+- **Type**: `{ enabled = bool, audit = bool, env = string[], command_inputs = string[] }`
+- **Default**: `{ enabled = false, audit = false, env = [], command_inputs = [] }`
 
 Stores successful task results in a content-addressed local cache and reuses them when the same task
 inputs are seen again. Declared filesystem outputs are restored after deletion. Tasks with
@@ -597,6 +597,25 @@ or retained. Command inputs inherit the task timeout, or have a 30-second timeou
 none, and may emit at most 16 MiB across stdout and stderr. They should be fast, deterministic, and
 free of side effects because they run whenever mise computes the task's cache key. Command inputs
 are not run during dry runs or when caching is disabled for raw or interactive execution.
+
+Set `cache.audit = true` to diagnose incomplete cache declarations on Linux. When a task executes,
+mise uses `strace` to report reads beneath the workspace root that do not match `sources` and writes
+beneath the task directory that do not match `outputs`. The audit is advisory and does not block the
+task or prevent a successful result from being cached. Access outside those roots and directory
+metadata reads are ignored to keep system libraries, executables, and path traversal out of the
+report.
+
+Audit mode requires `strace` on `PATH`. Mise warns and runs the task normally when tracing is not
+available; other platforms are not currently supported. Cached tasks are not executed and therefore
+produce no audit report, so use `mise run --force <task>` when checking an existing cache entry.
+
+```mise-toml
+[tasks.build]
+run = "npm run build"
+sources = ["package.json", "src/**"]
+outputs = ["dist"]
+cache = { enabled = true, audit = true }
+```
 
 #### External dependencies and lockfiles
 
@@ -647,8 +666,7 @@ for one run:
 - `read-only` uses cached results but does not publish misses.
 - `write-only` publishes results but always executes instead of restoring.
 - `off` disables task output caching and uses ordinary source/output freshness checks.
-- `local-only` reads and writes only the local cache. It currently behaves like `read-write` because
-  remote caching is not yet available.
+- `local-only` reads and writes only the local cache, bypassing any configured remote service.
 
 ```bash
 # Prevent an untrusted pull request from publishing cache entries
@@ -663,6 +681,104 @@ mise run --task-cache off build
 
 These modes only affect the experimental task output cache configured by a task's `cache` property.
 The existing `--no-cache` option controls fetching remote task definitions instead.
+
+#### Remote cache and sensitive data
+
+Configure the experimental remote build-cache service with `task.cache.remote_url` and a non-empty
+`task.cache.remote_namespace`. The namespace is an opaque repository or organization identifier;
+the server must isolate entries by both namespace and cache key. It is routing metadata, not an
+authentication mechanism or secret. Use a distinct namespace wherever writers should not be able to
+influence one another's cache entries.
+
+```mise-toml
+[settings]
+experimental = true
+task.cache.remote_url = "https://cache.example.com/mise/"
+task.cache.remote_namespace = "acme/widgets"
+task.cache.remote_mode = "read-write"
+```
+
+Set `MISE_TASK_CACHE_REMOTE_TOKEN` in the process environment to send a bearer credential. The
+equivalent `task.cache.remote_token` setting is global-only, but the environment variable is
+preferred so a token does not need to be written to disk. mise redacts the token from settings trace
+output and marks its HTTP header as sensitive. It requires HTTPS for non-loopback services; plain
+HTTP is accepted only for local development servers. Servers should still use short-lived,
+least-privilege credentials, restrict namespace access, avoid logging authorization headers, and
+encrypt or otherwise protect stored cache objects according to their sensitivity and retention
+requirements.
+
+For rotating credentials, set `MISE_TASK_CACHE_REMOTE_TOKEN_FILE` to a file containing only the
+bearer token. mise rereads the file before every request, which supports Kubernetes-projected
+service account tokens without restarting a long-running process. The equivalent
+`task.cache.remote_token_file` setting is global-only.
+
+In GitHub Actions, mise can acquire and refresh a short-lived OIDC token itself. Grant the workflow
+permission to request an identity token and set its audience explicitly:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      MISE_TASK_CACHE_REMOTE_OIDC_AUDIENCE: https://cache.example.com
+    steps:
+      - uses: actions/checkout@v5
+      - run: mise run test
+```
+
+The cache service must trust GitHub's issuer, accept the configured audience, and authorize the
+workflow's identity claims for the selected namespace. mise obtains the token from GitHub's job
+OIDC endpoint, keeps it only in memory, and refreshes it before expiry. The audience setting is
+global-only and acquisition fails clearly when the workflow lacks `id-token: write` permission.
+
+Credential precedence is explicit token, token file, then automatic OIDC. This lets an emergency
+static credential override workload identity without changing project configuration. Other CI
+providers can supply their issued OIDC token directly through `MISE_TASK_CACHE_REMOTE_TOKEN`; they
+do not need a protocol-specific integration.
+
+Task cache entries are not secret-free metadata. They contain captured stdout and stderr plus every
+declared output file. mise applies its configured output redactions before storing logs, but this is
+not a general secret scanner: a task can print an unknown credential or write one into an output
+artifact. Do not cache such a task unless those values are safe to retain and share with every
+reader of its local and remote cache. Clearing a local entry does not delete copies already uploaded
+to a remote service; use the remote service's retention and deletion controls as well.
+
+Artifact checksums detect corruption and HTTPS authenticates the configured server in transit, but
+a checksum is not a signature from the original task runner. Any principal allowed to write a
+namespace can publish entries that its readers will trust. Give untrusted pull-request jobs
+read-only credentials or no remote credentials, use `--task-cache read-only` to prevent publishing,
+and isolate less-trusted writers in a separate namespace.
+
+#### Cache correctness and deterministic tasks
+
+Enabling `cache` is a correctness assertion: identical cache-key material must produce equivalent
+captured logs and declared outputs. Every value that can change the result must be represented by a
+source or input group, a resolved mise tool, `cache.env`, `cache.command_inputs`, or a cacheable
+dependency's artifact key. This includes configuration and lockfiles, locale or feature flags,
+compiler wrappers, generated inputs, and relevant external service state. Operating system and
+architecture are included automatically; other machine state is not.
+
+Cache-enabled tasks should be deterministic and should not depend on undeclared files, wall-clock
+time, randomness, mutable network responses, or ambient environment variables. If such an input
+cannot be captured reliably, disable caching for the task. Pass-through environment variables are
+intentionally absent from the key and therefore must not influence cached logs or outputs. A task
+that uses credentials only to fetch content must key on a stable digest or lockfile for that content,
+not on the credential itself.
+
+Declared outputs must completely describe the filesystem state that a hit needs to reproduce. Side
+effects outside those paths—database writes, deployments, notifications, and changes elsewhere in
+the workspace—are not replayed. `outputs = []` is only correct when no filesystem side effect needs
+to be reproduced. On Linux, `cache.audit = true` can reveal many undeclared workspace reads and
+writes, but the audit is advisory and cannot prove determinism or observe every external dependency.
+
+When correctness is uncertain, use `--task-cache off` while diagnosing, add missing key inputs, and
+force an uncached execution before trusting new entries. Use separate remote namespaces when a
+change to task semantics or undeclared external state could otherwise collide with entries produced
+under a different trust policy.
 
 ```mise-toml
 [tasks.lint]
@@ -784,6 +900,14 @@ readable. `mise cache task <task> --json` includes the checksum for cache inspec
 Readers, writers, inspection, and task-scoped deletion coordinate through a cross-process lock for
 each cache key. Concurrent processes therefore see a complete archive and manifest pair instead of
 mistaking an in-progress replacement for corruption; writers for unrelated keys remain independent.
+Temporary archive and manifest files are removed when a write fails normally. On a later cache use,
+mise also removes partial files abandoned by an interrupted process after acquiring the associated
+cache-key lock, so it never deletes files that an active writer is still publishing.
+
+Set [`task.cache_max_size`](/configuration/settings.html#task-cache-max-size) to bound the total
+artifact cache size, or [`task.cache_max_age`](/configuration/settings.html#task-cache-max-age) to
+expire entries based on their last access. Both limits are optional and apply after successful cache
+writes. When a size limit is exceeded, mise removes least-recently-accessed entries first.
 
 When a cache-enabled task executes instead of restoring a result, mise reports the reason: no
 matching entry, a corrupt entry, forced execution, disabled reads, or a dependency that completed
@@ -799,10 +923,42 @@ Cacheable dependencies contribute their artifact keys to dependent task keys, so
 restore the matching artifact after its dependencies execute, skip, or restore. If a dependency
 executes without a stable artifact key, its dependents conservatively execute.
 
+### `rust_cache` <Badge type="warning" text="experimental" />
+
+- **Type**: `boolean | table`
+- **Default**: `false`
+
+Enables Rust compiler action caching only for this task run. `true` and `{}` both enable the default
+configuration; `false` and `{ enabled = false }` disable it. The table form is available from the
+start so future Rust-specific options do not require renaming the field.
+
+```mise-toml
+[tasks.build]
+run = "cargo build"
+rust_cache = true
+```
+
+mise injects compiler integration only into the task's child environment. Shell activation, bare
+`cargo build`, editor processes, and release builds are not intercepted. A top-level
+`mise run` owns the cache session, flushes pending uploads, and reports hits, misses, and transferred
+bytes before it succeeds. Compiler action-key collection and prefetch land with the compiler adapter
+rather than as unused task-manifest fields.
+
+Rust action caching disables incremental compilation for that task run because the two cache models
+are incompatible. This can make a tight local edit-and-build loop slower. Use `rust_cache` for CI,
+cold clones, worktrees, and branch switches; use bare `cargo build` for the local incremental loop.
+Outside CI, action cache sessions read local and remote results but do not upload them.
+
+`rust_cache` is independent of the task result `cache`: action caching can reuse individual compiler
+operations while the task still executes, and task result caching can be used without compiler
+interception. Set `task_config.rust_cache` to provide a scoped default; task-local `false` disables
+that inherited default.
+
 ### `shell`
 
 - **Type**: `string`
-- **Default**: [`unix_default_inline_shell_args`](/configuration/settings.html#unix_default_inline_shell_args) or [`windows_default_inline_shell_args`](/configuration/settings.html#windows_default_inline_shell_args)
+- **Default**: [`task_config.shell`](#task-config-shell) when set (config-scoped); otherwise
+  [`unix_default_inline_shell_args`](/configuration/settings.html#unix_default_inline_shell_args)/[`windows_default_inline_shell_args`](/configuration/settings.html#windows_default_inline_shell_args) (global-only).
 - **Note**: Only applies to toml-tasks.
 
 The shell to use to run the task. This is useful if you want to run a task with a different shell than
@@ -1044,8 +1200,9 @@ cascade = true
 shell = "bash -c"
 ```
 
-This applies to `dir`, `shell`, `cache`, and `includes`. Inherited include paths remain relative to
-the config root where they were defined, allowing a monorepo root to provide one shared task set.
+This applies to `dir`, `shell`, `cache`, `rust_cache`, and `includes`. Inherited include paths
+remain relative to the config root where they were defined, allowing a monorepo root to provide one
+shared task set.
 
 ### `task_config.dir`
 
@@ -1056,7 +1213,7 @@ Change the default directory tasks are run from.
 dir = "{{cwd}}"
 ```
 
-### `task_config.shell`
+### `task_config.shell` {#task-config-shell}
 
 Set the default shell for tasks in this config scope. A task's explicit `shell` setting takes
 precedence, including a `shell` inherited from a task template. With `task_config.cascade = true`,
@@ -1085,6 +1242,16 @@ Task-local and task-template cache configuration takes precedence, including
 enabled = true
 env = ["NODE_ENV", "CI"]
 command_inputs = ["node --version"]
+```
+
+### `task_config.rust_cache` <Badge type="warning" text="experimental" />
+
+Sets the scoped default for Rust action caching. A task-local or task-template value takes
+precedence; an explicit `false` disables the inherited default.
+
+```toml
+[task_config]
+rust_cache = true
 ```
 
 ### `task_config.global_env` <Badge type="warning" text="experimental" />
@@ -1175,6 +1342,20 @@ Global config files are loaded independently, so each global config file uses it
 
 Entries are evaluated in order, and when more than one include defines a task with the same name the **last** entry in the list wins.
 This applies uniformly to directory, toml-file, and `git::` includes, so to override a task coming from a `git::` include with a local one, list the local directory after the `git::` entry:
+
+An inline `[tasks.<name>]` command takes precedence over a same-named task from
+an included TOML file when it comes from the config that selected the include
+or a higher-precedence config. An inline block without `run`, `run_windows`, or
+`file` instead overlays metadata such as description, environment, and
+dependencies. For executable file tasks, the script also remains the task's
+command and the inline definition overlays its metadata.
+
+The same overlay rule applies across layered inline task definitions. For
+example, a metadata-only task in `mise.local.toml` overlays the nearest
+lower-precedence command-bearing definition in `mise.toml`. A higher-precedence
+definition with its own command still replaces the lower task. All metadata-only
+definitions above the selected command-bearing base contribute in precedence
+order, while definitions below it do not contribute metadata.
 
 ```toml
 [task_config]

@@ -18,7 +18,9 @@ use crate::task::task_script_parser::subcommand_name_from_parse;
 use crate::task::task_source_checker::{
     remove_auto_output, save_checksum, sources_are_fresh, task_cwd,
 };
-use crate::task::{Deps, FailedTasks, GetMatchingExt, Task, TaskCacheMode, TaskCacheOutput};
+use crate::task::{
+    Deps, FailedTasks, GetMatchingExt, Task, TaskCacheAudit, TaskCacheMode, TaskCacheOutput,
+};
 use crate::task::{TaskCompletionState, TaskDependencyState};
 use crate::tera::{contains_template_syntax, render_str};
 use crate::toolset::env_cache::CachedEnv;
@@ -213,6 +215,7 @@ pub struct TaskExecutorConfig {
     pub task_cache: TaskCacheMode,
     pub task_cache_explain: bool,
     pub task_cache_explain_json: bool,
+    pub cache_session: Option<crate::cache::session::CacheSessionEnvironment>,
     /// CLI-level sandbox overrides (merged with task-level sandbox config)
     pub sandbox: crate::sandbox::SandboxConfig,
 }
@@ -237,6 +240,7 @@ pub struct TaskExecutor {
     pub task_cache: TaskCacheMode,
     pub task_cache_explain: bool,
     pub task_cache_explain_json: bool,
+    pub cache_session: Option<crate::cache::session::CacheSessionEnvironment>,
     pub sandbox: crate::sandbox::SandboxConfig,
 }
 
@@ -289,6 +293,7 @@ impl TaskExecutor {
             task_cache: config.task_cache,
             task_cache_explain: config.task_cache_explain,
             task_cache_explain_json: config.task_cache_explain_json,
+            cache_session: config.cache_session,
             sandbox: config.sandbox,
         }
     }
@@ -391,6 +396,24 @@ impl TaskExecutor {
                 .cloned()
                 .collect(),
         };
+        if task.rust_cache.as_ref().is_some_and(|cache| cache.enabled)
+            && let Some(session) = &self.cache_session
+        {
+            if sandbox.effective_deny_read() {
+                sandbox.allow_read.extend(session.sandbox_paths());
+            }
+            if sandbox.effective_deny_write() {
+                sandbox.allow_write.extend(session.sandbox_paths());
+            }
+            if sandbox.effective_deny_env() {
+                sandbox.pass_through_env.extend([
+                    "MISE_CACHE_SOCKET".into(),
+                    "MISE_CACHE_PREVIOUS_RUSTC_WRAPPER".into(),
+                    "RUSTC_WRAPPER".into(),
+                    "CARGO_INCREMENTAL".into(),
+                ]);
+            }
+        }
         sandbox.resolve_paths();
         Ok(sandbox)
     }
@@ -669,6 +692,7 @@ impl TaskExecutor {
                             dependency_keys: &dependency_state.cache_keys,
                             command_inputs,
                             explain: self.task_cache_explain || self.task_cache_explain_json,
+                            mode: self.task_cache,
                         })
                         .await?;
                     if let Some(explanation) = cache.explanation() {
@@ -694,7 +718,7 @@ impl TaskExecutor {
                         && !dependency_state.any_unkeyed_did_work
                         && (task.outputs.is_no_files() || sources_are_fresh(task, config).await?)
                     {
-                        cache.current_output()
+                        cache.current_output().await
                     } else {
                         None
                     };
@@ -720,7 +744,7 @@ impl TaskExecutor {
                             TaskCacheMissReason::DependencyWithoutKey
                         } else {
                             Self::check_interruption(allow_during_interruption)?;
-                            match cache.restore(task)? {
+                            match cache.restore(task).await? {
                                 TaskCacheRestore::Hit(hit) => {
                                     self.cache_stats
                                         .lock()
@@ -781,6 +805,9 @@ impl TaskExecutor {
             .as_ref()
             .filter(|_| self.task_cache.writes())
             .map(|_| Arc::new(StdMutex::new(Vec::new())));
+        if let Some(session) = &self.cache_session {
+            session.apply(task, &mut env);
+        }
         let exec_ctx = TaskExecContext {
             task,
             env: &env,
@@ -858,7 +885,7 @@ impl TaskExecutor {
                 .as_ref()
                 .map(|output| output.lock().unwrap().clone())
                 .unwrap_or_default();
-            match cache.store(task, &output, execution_duration) {
+            match cache.store(task, &output, execution_duration).await {
                 Ok(()) => {
                     if let Err(err) = cache.mark_current() {
                         warn!(
@@ -1563,6 +1590,16 @@ impl TaskExecutor {
         let program =
             crate::path::resolve_posix_shell_program_path(&program, env).unwrap_or(program);
         let env = maybe_convert_env_for_msys_shell(Path::new(&program), env);
+        let audit = if raw || self.dry_run {
+            None
+        } else {
+            TaskCacheAudit::prepare(task, &config).await?
+        };
+        let (program, args) = if let Some(audit) = &audit {
+            audit.wrap(program, args)
+        } else {
+            (program, args.to_vec())
+        };
         let runner = CmdLineRunner::new(program.clone());
         // On Windows, `cmd_verbatim` means `args` are already wrapped for cmd.exe
         // and must be appended to the command line without std's MSVCRT-style
@@ -1572,10 +1609,10 @@ impl TaskExecutor {
         let runner = if cmd_verbatim {
             args.iter().fold(runner, |r, a| r.raw_arg(a))
         } else {
-            runner.args(args)
+            runner.args(&args)
         };
         #[cfg(not(windows))]
-        let runner = runner.args(args);
+        let runner = runner.args(&args);
         // Command inherits the current process environment in addition to the
         // explicit task env, so remove usage_* keys that argument parsing
         // intentionally cleared from the task env.
@@ -1803,10 +1840,15 @@ impl TaskExecutor {
         }
         // Apply sandbox async (DNS resolution for macOS) before spawning.
         cmd.apply_sandbox().await?;
-        cmd.execute_async_with_cancel_check(|| {
-            !allow_during_interruption && crate::ui::ctrlc::is_cancelled()
-        })
-        .await?;
+        let result = cmd
+            .execute_async_with_cancel_check(|| {
+                !allow_during_interruption && crate::ui::ctrlc::is_cancelled()
+            })
+            .await;
+        if let Some(audit) = audit {
+            audit.report(task);
+        }
+        result?;
         trace!("{prefix} exited successfully");
         Ok(())
     }
@@ -1901,7 +1943,7 @@ impl TaskExecutor {
                 || !spec.cmd.flags.is_empty()
                 || !spec.cmd.subcommands.is_empty())
         {
-            let args: Vec<String> = get_args();
+            let args = task.args_for_usage_parser(&spec, &get_args());
             trace!("Parsing usage spec for {:?}", args);
             // Pass env vars to Parser so it can resolve env= defaults in usage specs
             let env_map: std::collections::HashMap<String, String> =

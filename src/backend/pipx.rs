@@ -6,11 +6,13 @@ use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
+use crate::duration::parse_into_timestamp;
 #[cfg(unix)]
 use crate::env;
 #[cfg(unix)]
 use crate::file;
 use crate::github::{self, GithubRelease};
+use crate::hash::hash_to_str;
 use crate::http::HTTP_FETCH;
 use crate::install_context::InstallContext;
 use crate::plugins::PEP440_PRERELEASE_REGEX;
@@ -42,7 +44,6 @@ const UV_EXCLUDE_NEWER_VERSION: &str = "0.2.22";
 #[derive(Debug)]
 pub struct PIPXBackend {
     ba: Arc<BackendArg>,
-    latest_version_cache: CacheManager<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +68,10 @@ impl<'a> PipxOptions<'a> {
 
     fn pipx_args(&self) -> Option<&'a str> {
         self.values.str("pipx_args")
+    }
+
+    fn registry_url(&self) -> Option<&'a str> {
+        self.values.str("registry_url")
     }
 
     fn uvx_args(&self) -> Option<&'a str> {
@@ -137,10 +142,17 @@ impl Backend for PIPXBackend {
         false
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
+    async fn remote_version_cache_context(&self, config: &Arc<Config>) -> Result<Option<String>> {
+        match self.tool_name().parse()? {
+            PipxRequest::Pypi(_) => self.get_registry_url(config).await.map(Some),
+            PipxRequest::Git(_) => Ok(None),
+        }
+    }
+
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         let versions: Vec<VersionInfo> = match self.tool_name().parse()? {
             PipxRequest::Pypi(package) => {
-                let registry_url = Self::get_registry_url()?;
+                let registry_url = self.get_registry_url(config).await?;
                 if registry_url.contains("/json") {
                     debug!("Fetching JSON for {}", package);
                     let url = registry_url.replace("{}", &package);
@@ -198,53 +210,53 @@ impl Backend for PIPXBackend {
             .collect())
     }
 
-    async fn latest_stable_version(&self, _config: &Arc<Config>) -> eyre::Result<Option<String>> {
-        let this = self;
+    async fn latest_stable_version(&self, config: &Arc<Config>) -> eyre::Result<Option<String>> {
+        let package = match self.tool_name().parse()? {
+            PipxRequest::Pypi(package) => package,
+            PipxRequest::Git(_) => return Ok(None),
+        };
+        let registry_url = self.get_registry_url(config).await?;
+        let latest_version_cache = self.latest_version_cache(&registry_url);
         timeout::run_with_timeout_async(
             async || {
-                this.latest_version_cache
-                    .get_or_try_init_async(async || match this.tool_name().parse()? {
-                        PipxRequest::Pypi(package) => {
-                            let registry_url = Self::get_registry_url()?;
-                            if registry_url.contains("/json") {
-                                debug!("Fetching JSON for {}", package);
-                                let url = registry_url.replace("{}", &package);
-                                let pkg: PypiPackage = HTTP_FETCH.json(url).await?;
-                                Ok(Self::latest_stable_from_pypi_package(pkg))
-                            } else {
-                                debug!("Fetching HTML for {}", package);
-                                let url = registry_url.replace("{}", &package);
-                                let html = HTTP_FETCH.get_html(url).await?;
+                latest_version_cache
+                    .get_or_try_init_async(async || {
+                        if registry_url.contains("/json") {
+                            debug!("Fetching JSON for {}", package);
+                            let url = registry_url.replace("{}", &package);
+                            let pkg: PypiPackage = HTTP_FETCH.json(url).await?;
+                            Ok(Self::latest_stable_from_pypi_package(pkg))
+                        } else {
+                            debug!("Fetching HTML for {}", package);
+                            let url = registry_url.replace("{}", &package);
+                            let html = HTTP_FETCH.get_html(url).await?;
 
-                                 // PEP-0503
-                                let version_re = regex!(r#"href=["'][^"']*/([^/]+)\.tar\.gz(?:#(md5|sha1|sha224|sha256|sha384|sha512)=[0-9A-Fa-f]+)?["']"#);
+                            // PEP-0503
+                            let version_re = regex!(r#"href=["'][^"']*/([^/]+)\.tar\.gz(?:#(md5|sha1|sha224|sha256|sha384|sha512)=[0-9A-Fa-f]+)?["']"#);
 
-                                let version = version_re
-                                    .captures_iter(&html)
-                                    .filter_map(|cap| {
-                                        let filename = cap.get(1)?.as_str();
-                                        let escaped_package = regex::escape(&package);
-                                        // PEP-503: normalize package names by replacing hyphens with character class that allows -, _, .
-                                        let re_str = escaped_package.replace(r"\-", r"[\-_.]");
-                                        let re_str = format!("^{re_str}-(.+)$");
-                                        let pkg_re = regex::Regex::new(&re_str).ok()?;
-                                        let pkg_version =
-                                            pkg_re.captures(filename)?.get(1)?.as_str();
-                                        Some(pkg_version.to_string())
-                                    })
-                                    .filter(|v| {
-                                        !v.contains("dev")
-                                            && !v.contains("a")
-                                            && !v.contains("b")
-                                            && !v.contains("rc")
-                                    })
-                                    .sorted_by_cached_key(|v| Versioning::new(v))
-                                    .next_back();
+                            let version = version_re
+                                .captures_iter(&html)
+                                .filter_map(|cap| {
+                                    let filename = cap.get(1)?.as_str();
+                                    let escaped_package = regex::escape(&package);
+                                    // PEP-503: normalize package names by replacing hyphens with character class that allows -, _, .
+                                    let re_str = escaped_package.replace(r"\-", r"[\-_.]");
+                                    let re_str = format!("^{re_str}-(.+)$");
+                                    let pkg_re = regex::Regex::new(&re_str).ok()?;
+                                    let pkg_version = pkg_re.captures(filename)?.get(1)?.as_str();
+                                    Some(pkg_version.to_string())
+                                })
+                                .filter(|v| {
+                                    !v.contains("dev")
+                                        && !v.contains("a")
+                                        && !v.contains("b")
+                                        && !v.contains("rc")
+                                })
+                                .sorted_by_cached_key(|v| Versioning::new(v))
+                                .next_back();
 
-                                Ok(version)
-                            }
+                            Ok(version)
                         }
-                        _ => Ok(None),
                     })
                     .await
             },
@@ -263,7 +275,7 @@ impl Backend for PIPXBackend {
 
     async fn resolve_exact_version(
         &self,
-        _config: &Arc<Config>,
+        config: &Arc<Config>,
         version: &str,
     ) -> eyre::Result<Option<String>> {
         // Git-sourced tools resolve versions from repo tags, which cannot be
@@ -277,7 +289,7 @@ impl Backend for PIPXBackend {
         // Surface malformed registry configuration at resolve time like
         // remote discovery would — installation only sees the derived index
         // URL, which skips this validation.
-        Self::get_registry_url()?;
+        self.get_registry_url(config).await?;
         // PEP 440 allows non-semver versions (1.2.3.4, 1.2.3rc1, 1.2.3.post1)
         // — those keep using remote discovery. A full semver request is
         // exact; `pipx install pkg==version` / `uv tool install` fail when it
@@ -461,12 +473,28 @@ impl PIPXBackend {
             .filter(|(_, files)| files.iter().any(|f| !f.yanked))
             .sorted_by_cached_key(|(v, _)| Versioning::new(v))
             .map(|(version, files)| {
+                // Prefer the RFC3339 `upload_time_iso_8601` over the
+                // timezone-naive `upload_time`: the latter has no offset, so
+                // `parse_into_timestamp` parses it as a `civil::Date` and
+                // substitutes end-of-day UTC, dropping the real time-of-day
+                // and inflating `minimum_release_age` for same-day releases by
+                // up to ~24h. Custom indexes without the ISO field fall back to
+                // `upload_time` as before.
                 let created_at = files
                     .iter()
                     .filter(|f| !f.yanked)
-                    .filter_map(|f| f.upload_time.as_ref())
-                    .min()
-                    .cloned();
+                    .filter_map(|f| {
+                        f.upload_time_iso_8601
+                            .clone()
+                            .or_else(|| f.upload_time.clone())
+                    })
+                    // Pick the earliest upload as a parsed instant, not by
+                    // lexicographic string order: RFC3339 strings with
+                    // different offsets (`...00:00-05:00` vs `...04:00Z`) do
+                    // not sort chronologically, so a naive `.min()` on the raw
+                    // strings can select a later instant and over-gate.
+                    .min_by_key(|s| parse_into_timestamp(s).unwrap_or(Timestamp::MAX));
+
                 VersionInfo {
                     version,
                     created_at,
@@ -488,10 +516,13 @@ impl PIPXBackend {
         releases
             .into_iter()
             .rev()
-            .map(|r| VersionInfo {
-                version: r.tag_name,
-                created_at: Some(r.created_at),
-                ..Default::default()
+            .map(|r| {
+                let created_at = Some(r.released_at().to_string());
+                VersionInfo {
+                    version: r.tag_name,
+                    created_at,
+                    ..Default::default()
+                }
             })
             .collect()
     }
@@ -513,14 +544,18 @@ impl PIPXBackend {
     }
 
     pub fn from_arg(ba: BackendArg) -> Self {
-        Self {
-            latest_version_cache: CacheManagerBuilder::new(
-                ba.cache_path.join("latest_version.msgpack.z"),
-            )
-            .with_fresh_duration(Settings::get().fetch_remote_versions_cache())
-            .build(),
-            ba: Arc::new(ba),
-        }
+        Self { ba: Arc::new(ba) }
+    }
+
+    fn latest_version_cache(&self, registry_url: &str) -> CacheManager<Option<String>> {
+        let registry_hash = hash_to_str(&registry_url);
+        CacheManagerBuilder::new(
+            self.ba
+                .cache_path
+                .join(format!("latest_version_{registry_hash}.msgpack.z")),
+        )
+        .with_fresh_duration(Settings::get().fetch_remote_versions_cache())
+        .build()
     }
 
     fn get_index_url() -> eyre::Result<String> {
@@ -559,8 +594,13 @@ impl PIPXBackend {
         Ok(url)
     }
 
-    fn get_registry_url() -> eyre::Result<String> {
-        let registry_url = Settings::get().pipx.registry_url.clone();
+    async fn get_registry_url(&self, config: &Arc<Config>) -> eyre::Result<String> {
+        let raw_options = config.get_tool_opts_with_overrides(&self.ba).await?;
+        let options = PipxOptions::new(&raw_options);
+        let registry_url = options
+            .registry_url()
+            .map(str::to_owned)
+            .unwrap_or_else(|| Settings::get().pipx.registry_url.clone());
 
         debug!("Pipx registry URL: {}", registry_url);
 
@@ -755,6 +795,7 @@ struct PypiPackage {
 #[derive(serde::Deserialize)]
 struct PypiRelease {
     upload_time: Option<String>,
+    upload_time_iso_8601: Option<String>,
     #[serde(default, deserialize_with = "deserialize_pypi_yanked")]
     yanked: bool,
 }
@@ -960,6 +1001,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn per_tool_registry_url_resolves_latest_version() {
+        use crate::backend::Backend;
+
+        let mut server = mockito::Server::new_async().await;
+        let registry = server
+            .mock("GET", "/pypi/private-tool/json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "releases": {
+                        "1.0.0": [{
+                            "upload_time": "2026-01-01T00:00:00",
+                            "upload_time_iso_8601": "2026-01-01T00:00:00Z",
+                            "yanked": false
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let config = crate::config::Config::get().await.unwrap();
+        let backend = PIPXBackend::from_arg(
+            format!(
+                "pipx:private-tool[registry_url='{}/pypi/{{}}/json']",
+                server.url()
+            )
+            .into(),
+        );
+
+        assert_eq!(
+            backend
+                .latest_stable_version(&config)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1.0.0")
+        );
+        registry.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn per_tool_registries_isolate_remote_version_cache() {
+        use crate::backend::Backend;
+
+        let mut first_server = mockito::Server::new_async().await;
+        let first_registry = first_server
+            .mock("GET", "/pypi/private-tool/json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "releases": {
+                        "1.0.0": [{
+                            "upload_time": "2026-01-01T00:00:00",
+                            "upload_time_iso_8601": "2026-01-01T00:00:00Z",
+                            "yanked": false
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let mut second_server = mockito::Server::new_async().await;
+        let second_registry = second_server
+            .mock("GET", "/pypi/private-tool/json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "releases": {
+                        "2.0.0": [{
+                            "upload_time": "2026-02-01T00:00:00",
+                            "upload_time_iso_8601": "2026-02-01T00:00:00Z",
+                            "yanked": false
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let config = crate::config::Config::get().await.unwrap();
+        let first_backend = PIPXBackend::from_arg(
+            format!(
+                "pipx:private-tool[registry_url='{}/pypi/{{}}/json']",
+                first_server.url()
+            )
+            .into(),
+        );
+        let second_backend = PIPXBackend::from_arg(
+            format!(
+                "pipx:private-tool[registry_url='{}/pypi/{{}}/json']",
+                second_server.url()
+            )
+            .into(),
+        );
+
+        assert_eq!(
+            first_backend.list_remote_versions(&config).await.unwrap(),
+            vec!["1.0.0"]
+        );
+        assert_eq!(
+            second_backend.list_remote_versions(&config).await.unwrap(),
+            vec!["2.0.0"]
+        );
+        first_registry.assert_async().await;
+        second_registry.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn non_semver_versions_require_remote_discovery() {
         use crate::backend::Backend;
         let config = crate::config::Config::get().await.unwrap();
@@ -1129,6 +1283,75 @@ mod tests {
     }
 
     #[test]
+    fn test_versions_from_pypi_package_preserves_time_of_day_from_iso_field() {
+        // PyPI's JSON carries both a naive `upload_time` (no offset) and an
+        // RFC3339 `upload_time_iso_8601`. Preferring the ISO field keeps the
+        // real upload instant; the naive field would parse as a `civil::Date`
+        // and collapse to end-of-day UTC, inflating `minimum_release_age`.
+        fn release(iso: Option<&str>, naive: Option<&str>) -> PypiRelease {
+            PypiRelease {
+                upload_time: naive.map(str::to_string),
+                upload_time_iso_8601: iso.map(str::to_string),
+                yanked: false,
+            }
+        }
+
+        let versions = PIPXBackend::versions_from_pypi_package(pypi_package(vec![
+            // Both fields present: the precise midday instant wins.
+            (
+                "1.0.0",
+                vec![release(
+                    Some("2024-01-02T10:05:14.723989Z"),
+                    Some("2024-01-02T10:05:14"),
+                )],
+            ),
+            // Index without the ISO field: naive fallback still yields a
+            // timestamp (here end-of-day UTC), so release-age gating degrades
+            // gracefully rather than disappearing.
+            ("1.1.0", vec![release(None, Some("2024-01-03"))]),
+        ]));
+
+        let parsed: Vec<_> = versions
+            .iter()
+            .map(|v| v.created_at_timestamp().map(|t| t.to_string()))
+            .collect();
+        // ISO field: real upload instant, not 2024-01-02T23:59:59Z.
+        assert_eq!(parsed[0].as_deref(), Some("2024-01-02T10:05:14.723989Z"));
+        // Naive-only fallback: parses as a date, end-of-day UTC.
+        assert_eq!(parsed[1].as_deref(), Some("2024-01-03T23:59:59Z"));
+    }
+
+    #[test]
+    fn test_versions_from_pypi_package_picks_earliest_instant_not_lexical_min() {
+        // A custom index may return RFC3339 timestamps with differing offsets.
+        // These two are the same instant, but lexicographic order and
+        // chronological UTC order diverge for different-offset strings, so the
+        // earliest upload must be selected by parsed instant.
+        //
+        //   "2024-01-02T00:00:00-05:00"  ==  2024-01-02T05:00:00Z
+        //   "2024-01-02T04:30:00Z"            2024-01-02T04:30:00Z  (earlier)
+        //
+        // Lexical min is the first ("-05:00" string sorts before "Z"), but the
+        // second is 30 min earlier in UTC and must win.
+        let release = |iso: &str| PypiRelease {
+            upload_time: None,
+            upload_time_iso_8601: Some(iso.to_string()),
+            yanked: false,
+        };
+        let versions = PIPXBackend::versions_from_pypi_package(pypi_package(vec![(
+            "1.0.0",
+            vec![
+                release("2024-01-02T00:00:00-05:00"),
+                release("2024-01-02T04:30:00Z"),
+            ],
+        )]));
+        assert_eq!(
+            versions[0].created_at.as_deref(),
+            Some("2024-01-02T04:30:00Z"),
+        );
+    }
+
+    #[test]
     fn test_latest_stable_from_pypi_package_skips_yanked_and_prerelease() {
         let version = PIPXBackend::latest_stable_from_pypi_package(pypi_package(vec![
             (
@@ -1273,6 +1496,7 @@ mod tests {
             draft: false,
             prerelease: false,
             created_at: created_at.to_string(),
+            published_at: None,
             assets: vec![],
         }
     }
@@ -1289,6 +1513,7 @@ mod tests {
     fn pypi_release(upload_time: Option<&str>, yanked: bool) -> PypiRelease {
         PypiRelease {
             upload_time: upload_time.map(str::to_string),
+            upload_time_iso_8601: upload_time.map(str::to_string),
             yanked,
         }
     }

@@ -1439,11 +1439,13 @@ gh = "latest"
 But you'd like the versions installed to be consistent within a project. When this is enabled, mise will update mise.lock
 files next to mise.toml files containing pinned versions. When installing tools, mise will reference this lockfile if it exists and this setting is enabled to resolve versions.
 
-The lockfiles are not created automatically. To generate them, run the following (assuming the config file is `mise.toml`):
+When set to `true` in a TOML settings file, project lockfiles are created and maintained automatically. When unset, existing lockfiles are read and updated but new lockfiles are not created. `MISE_LOCKFILE=1` retains this existing-lockfile behavior for backwards compatibility. To generate one explicitly, run:
 
 ```sh
-touch mise.lock && mise install
+mise lock
 ```
+
+Global lockfiles are only created with `mise lock --global`.
 
 The lockfile is named the same as the config file but with `.lock` instead of `.toml` as the extension, e.g.:
 
@@ -1451,9 +1453,9 @@ The lockfile is named the same as the config file but with `.lock` instead of `.
 - `mise.local.toml` -> `mise.local.lock`
 - `.config/mise.toml` -> `.config/mise.lock`
 
-When set to `true`, lockfiles are read and written. When set to `false`, lockfiles are explicitly disabled—this
+When set to `true`, project lockfiles are created, read, and written. When set to `false`, lockfiles are explicitly disabled—this
 will cause an error if `locked = true` is also set, since locked mode requires reading lockfiles.
-When unset (the default), lockfiles are enabled (same as `true`) but there is no conflict with `locked` mode.
+When unset (the default), existing lockfiles are read and written, but new lockfiles are not created.
 """
 env = "MISE_LOCKFILE"
 optional = true
@@ -1763,6 +1765,21 @@ the tool installed first, so it cannot auto-install completely new tools.
 This also runs in shims if the terminal is interactive.
 """
 env = "MISE_NOT_FOUND_AUTO_INSTALL"
+type = "Bool"
+
+[not_found_system_fallback]
+default = true
+description = "Set to false to stop shims from falling back to a same-named binary found elsewhere on PATH."
+docs = """
+When a shim cannot resolve a mise-managed tool, it falls back to the first same-named executable found on
+`PATH` outside the shims directory. That is useful for tools you also want to work outside of mise, but it
+means a configured-but-uninstalled version can silently run an unrelated system binary instead of erroring
+— common for tools the OS also ships, like `python3`.
+
+Set to false, alongside [`not_found_auto_install`](#not_found_auto_install), to make an unresolvable shim
+fail loudly instead.
+"""
+env = "MISE_NOT_FOUND_SYSTEM_FALLBACK"
 type = "Bool"
 
 
@@ -2204,13 +2221,17 @@ optional = true
 type = "String"
 
 [ruby.compile]
-description = "Set to true to compile ruby from source, false to use precompiled binaries."
+description = "If true, compile ruby from source. If false, require precompiled binaries. If not set, use precompiled binaries if available."
 docs = """
 Controls whether Ruby is compiled from source or downloaded as precompiled binaries.
 
-- If `false`: Try precompiled binaries first, fall back to compiling if unavailable
+- If `false`: Only use precompiled binaries. Installs error out instead of falling back to
+  ruby-build, and version listings only include versions that have a precompiled binary for
+  the current platform.
 - If `true`: Always compile from source using ruby-build
 - If unset: Try precompiled binaries first, fall back to compiling if unavailable
+
+This setting has no effect on Windows, which installs Ruby from RubyInstaller2.
 """
 env = "MISE_RUBY_COMPILE"
 optional = true
@@ -2620,6 +2641,94 @@ it, and skips sudo entirely when already running as root (e.g. containers/CI).
 env = "MISE_SYSTEM_PACKAGES_SUDO"
 type = "Bool"
 
+[task.auto_infer]
+default = []
+description = "[experimental] Workspace providers from which to automatically infer tasks."
+docs = """
+List the workspace provider languages whose ecosystem tasks mise should import. For example,
+`["node"]` imports scripts from Node workspace `package.json` files. Inferred tasks use stable
+provider-scoped names and monorepo path aliases. Task inference is opt-in because ecosystem commands
+may overlap with explicit mise tasks.
+"""
+env = "MISE_TASK_AUTO_INFER"
+parse_env = "set_by_comma"
+rust_type = "BTreeSet<String>"
+type = "SetString"
+
+[task.cache.remote_mode]
+default = "read-write"
+description = "[experimental] Remote task and action cache access mode."
+docs = """
+Control access to the remote cache used by task result and action caching:
+
+- `read-write` reads remote misses and uploads successful local results.
+- `read-only` reads remote misses without uploading results.
+- `write-only` uploads results without reading remote entries.
+
+The per-run `--task-cache=local-only` mode disables remote task-result access. Action-cache adapters
+may further restrict this mode; local developer task runs are read-only by default.
+"""
+enum = ["read-write", "read-only", "write-only"]
+env = "MISE_TASK_CACHE_REMOTE_MODE"
+rust_type = "crate::cache::CacheRemoteMode"
+type = "String"
+
+[task.cache.remote_namespace]
+description = "[experimental] Namespace sent to the remote build cache."
+docs = """
+Opaque repository or organization namespace used to isolate remote build-cache entries. This
+setting is required when [`task.cache.remote_url`](#task-cache-remote-url) is configured.
+"""
+env = "MISE_TASK_CACHE_REMOTE_NAMESPACE"
+optional = true
+type = "String"
+
+[task.cache.remote_oidc_audience]
+description = "[experimental] Audience for an automatically acquired remote cache OIDC token."
+docs = """
+Acquire a short-lived OIDC token for this audience when running in a supported workload identity
+environment. GitHub Actions is supported through its OIDC request environment variables. This
+setting is global-only so shared project configuration cannot choose a token audience.
+"""
+env = "MISE_TASK_CACHE_REMOTE_OIDC_AUDIENCE"
+global_only = true
+optional = true
+type = "String"
+
+[task.cache.remote_token]
+description = "[experimental] Bearer token for remote build-cache authentication."
+docs = """
+Authenticate remote build-cache requests with an HTTP `Authorization: Bearer` header. Prefer the
+`MISE_TASK_CACHE_REMOTE_TOKEN` environment variable or a protected global configuration file; this
+setting is global-only so shared project configuration cannot supply credentials.
+"""
+env = "MISE_TASK_CACHE_REMOTE_TOKEN"
+global_only = true
+optional = true
+type = "String"
+
+[task.cache.remote_token_file]
+description = "[experimental] File containing a remote build-cache bearer token."
+docs = """
+Read the remote build-cache bearer token from this file before each request. This supports rotating
+credentials such as Kubernetes projected service account tokens. This setting is global-only so
+shared project configuration cannot select a credential file.
+"""
+env = "MISE_TASK_CACHE_REMOTE_TOKEN_FILE"
+global_only = true
+optional = true
+type = "Path"
+
+[task.cache.remote_url]
+description = "[experimental] Base URL for the remote build-cache service."
+docs = """
+Enable the versioned HTTP remote build-cache protocol at this base URL. Remote access also requires
+[`task.cache.remote_namespace`](#task-cache-remote-namespace). Leave unset to use only local caches.
+"""
+env = "MISE_TASK_CACHE_REMOTE_URL"
+optional = true
+type = "Url"
+
 [task.cache_dir]
 description = "[experimental] Directory for task output cache artifacts."
 docs = """
@@ -2631,6 +2740,87 @@ manual and automatic cache pruning.
 env = "MISE_TASK_CACHE_DIR"
 optional = true
 type = "Path"
+
+[task.cache_max_age]
+description = "[experimental] Maximum age of task output cache entries since their last access."
+docs = """
+Remove task output cache entries that have not been accessed within this duration after a new entry
+is stored. This limit applies only to the task output cache and is independent of
+[`cache_prune_age`](#cache_prune_age). Set to `0s` or leave unset to disable the age limit.
+"""
+env = "MISE_TASK_CACHE_MAX_AGE"
+optional = true
+type = "Duration"
+
+[task.cache_max_size]
+description = "[experimental] Maximum total size of task output cache entries."
+docs = """
+Keep the task output cache at or below this size by removing least-recently-accessed entries after a
+new entry is stored. Values accept SI or IEC units such as `500MB` or `2GiB`. Set to `0` or leave
+unset to disable the size limit.
+"""
+env = "MISE_TASK_CACHE_MAX_SIZE"
+optional = true
+type = "String"
+
+[task.cache_remote_mode]
+deprecated = "Use task.cache.remote_mode instead."
+deprecated_remove_at = "2027.8.0"
+deprecated_warn_at = "2027.2.0"
+description = "Compatibility alias for task.cache.remote_mode."
+enum = ["read-write", "read-only", "write-only"]
+hide = true
+optional = true
+rust_type = "crate::cache::CacheRemoteMode"
+type = "String"
+
+[task.cache_remote_namespace]
+deprecated = "Use task.cache.remote_namespace instead."
+deprecated_remove_at = "2027.8.0"
+deprecated_warn_at = "2027.2.0"
+description = "Compatibility alias for task.cache.remote_namespace."
+hide = true
+optional = true
+type = "String"
+
+[task.cache_remote_oidc_audience]
+deprecated = "Use task.cache.remote_oidc_audience instead."
+deprecated_remove_at = "2027.8.0"
+deprecated_warn_at = "2027.2.0"
+description = "Compatibility alias for task.cache.remote_oidc_audience."
+global_only = true
+hide = true
+optional = true
+type = "String"
+
+[task.cache_remote_token]
+deprecated = "Use task.cache.remote_token instead."
+deprecated_remove_at = "2027.8.0"
+deprecated_warn_at = "2027.2.0"
+description = "Compatibility alias for task.cache.remote_token."
+global_only = true
+hide = true
+optional = true
+type = "String"
+
+[task.cache_remote_token_file]
+deprecated = "Use task.cache.remote_token_file instead."
+deprecated_remove_at = "2027.8.0"
+deprecated_warn_at = "2027.2.0"
+description = "Compatibility alias for task.cache.remote_token_file."
+global_only = true
+hide = true
+optional = true
+type = "Path"
+
+[task.cache_remote_url]
+deprecated = "Use task.cache.remote_url instead."
+deprecated_remove_at = "2027.8.0"
+deprecated_warn_at = "2027.2.0"
+description = "Compatibility alias for task.cache.remote_url."
+hide = true
+optional = true
+type = "Url"
 
 [task.disable_paths]
 default = []

@@ -123,6 +123,30 @@ async fn which_shim(
         .with_resolve_options(resolve_options)
         .build(config)
         .await?;
+    // A configured tool may intentionally override an executable bundled by another installed
+    // tool (for example, a pinned npm overrides Node's npm). Install a missing provider declared
+    // by the registry before resolving an incidental installed provider.
+    if !completion_offline
+        && Settings::get().not_found_auto_install
+        && ts
+            .should_install_missing_registry_bin_provider(config, bin_name)
+            .await?
+    {
+        for tv in ts
+            .install_missing_bin(config, bin_name)
+            .await?
+            .unwrap_or_default()
+        {
+            let p = tv.backend()?;
+            if let Some(bin) = p.which(config, &tv, bin_name).await? {
+                trace!(
+                    "shim[{bin_name}] REGISTRY ToolVersion: {tv} bin: {bin}",
+                    bin = display_path(&bin)
+                );
+                return Ok((bin, ts));
+            }
+        }
+    }
     if let Some((p, tv)) = ts.which(config, bin_name).await
         && let Some(bin) = p.which(config, &tv, bin_name).await?
     {
@@ -151,22 +175,24 @@ async fn which_shim(
         }
     }
     // fallback for "system"
-    let mise_bin = file::canonicalize_or_self(&env::MISE_BIN);
-    for path in &*env::PATH {
-        if file::is_mise_shims_dir(path) {
-            continue;
-        }
-        let bin = path.join(bin_name);
-        if bin.exists() {
-            if file::is_active_mise_shim(&bin) {
+    if Settings::get().not_found_system_fallback {
+        let mise_bin = file::canonicalize_or_self(&env::MISE_BIN);
+        for path in &*env::PATH {
+            if file::is_mise_shims_dir(path) {
                 continue;
             }
-            // Skip if this binary is a mise shim (symlink pointing to the mise binary)
-            if file::canonicalize_cached(&bin).is_some_and(|bin| bin == mise_bin) {
-                continue;
+            let bin = path.join(bin_name);
+            if bin.exists() {
+                if file::is_active_mise_shim(&bin) {
+                    continue;
+                }
+                // Skip if this binary is a mise shim (symlink pointing to the mise binary)
+                if file::canonicalize_cached(&bin).is_some_and(|bin| bin == mise_bin) {
+                    continue;
+                }
+                trace!("shim[{bin_name}] SYSTEM {bin}", bin = display_path(&bin));
+                return Ok((bin, ts));
             }
-            trace!("shim[{bin_name}] SYSTEM {bin}", bin = display_path(&bin));
-            return Ok((bin, ts));
         }
     }
     let tvs = ts.list_rtvs_with_bin(config, bin_name).await?;

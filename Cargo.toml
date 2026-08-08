@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/mise-cache-core",
+  "crates/mise-cache-rustc",
   "crates/vfox",
   "crates/aqua-registry",
   "crates/mise-interactive-config",
@@ -10,7 +12,7 @@ members = [
 
 [package]
 name = "mise"
-version = "2026.8.0"
+version = "2026.8.3"
 edition = "2024"
 description = "Dev tools, env vars, and tasks in one CLI"
 authors = ["Jeff Dickey (@jdx)"]
@@ -67,10 +69,10 @@ opt-level = 3
 [dependencies]
 age = { version = "0.12", features = ["ssh"] }
 aho-corasick = "1"
-aube-registry = { version = "1.37", default-features = false, features = [
+aube-registry = { version = "1.38", default-features = false, features = [
   "rustls",
 ] }
-aube = { version = "1.37", default-features = false, features = ["rustls"] }
+aube = { version = "1.38", default-features = false, features = ["rustls"] }
 async-backtrace = "0.2"
 async-trait = "0.1"
 aws-config = { version = "1.5", default-features = false, features = [
@@ -86,7 +88,7 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
   "behavior-version-latest",
   "default-https-client",
 ] }
-base64 = "0.22"
+base64 = "0.23"
 bytesize = "2"
 bzip2 = "0.6"
 calm_io = "0.1"
@@ -114,6 +116,7 @@ filetime = "0.2"
 flate2 = "1"
 futures-util = "0.3.32"
 mise-sigstore = { path = "crates/mise-sigstore", default-features = false }
+mise-cache-core = { path = "crates/mise-cache-core", default-features = false }
 fslock = "0.2.1"
 gix = { version = "<1", features = ["worktree-mutation"] }
 glob = "0.3"
@@ -123,6 +126,7 @@ heck = "0.5"
 hex = "0.4"
 indenter = "0.3"
 indexmap = { version = "2", features = ["serde"] }
+ipnet = { version = "2", features = ["serde"] }
 clx = "3"
 indoc = "2"
 itertools = "0.15"
@@ -144,16 +148,16 @@ petgraph = "0.8"
 pgp = "0.20"
 phf = "0.14"
 rand = "0.10"
-rattler = { version = "0.47", default-features = false }
-rattler_conda_types = { version = "0.48", default-features = false }
-rattler_repodata_gateway = { version = "0.30", default-features = false, features = [
+rattler = { version = "0.48", default-features = false }
+rattler_conda_types = { version = "0.49", default-features = false }
+rattler_repodata_gateway = { version = "0.31", default-features = false, features = [
   "gateway",
 ] }
-rattler_solve = { version = "7", default-features = false, features = [
+rattler_solve = { version = "9", default-features = false, features = [
   "resolvo",
 ] }
 rattler_package_streaming = { version = "0.26", default-features = false }
-rattler_virtual_packages = { version = "3", default-features = false }
+rattler_virtual_packages = { version = "4", default-features = false }
 regex = "1"
 plist = "1"
 reqwest = { version = "0.13", default-features = false, features = [
@@ -167,7 +171,7 @@ reqwest = { version = "0.13", default-features = false, features = [
   "stream",
   "system-proxy",
 ] }
-rmcp = { version = "2.0", features = ["server", "transport-io", "schemars"] }
+rmcp = { version = "3.0", features = ["server", "transport-io", "schemars"] }
 rmp-serde = "1"
 rops = { version = "0.1", default-features = false, features = [
   "aes-gcm",
@@ -221,7 +225,7 @@ tree-sitter-iter = "=1.27.0"
 ubi = { version = "0.10", default-features = false }
 url = "2"
 urlencoding = "2"
-usage-lib = { version = "4", features = ["clap", "docs"] }
+usage-lib = { version = "5", features = ["clap", "docs"] }
 versions = { version = "7", features = ["serde"] }
 vfox = { path = "crates/vfox", default-features = false }
 aqua-registry = { path = "crates/aqua-registry" }
@@ -256,6 +260,11 @@ self_update = { version = "0.44", optional = true, default-features = false, fea
 ] }
 zipsign-api = "0.2"
 winapi = { version = "0.3.9", features = ["consoleapi", "minwindef"] }
+windows-sys = { version = "0.61", features = [
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Threading",
+] }
 
 [build-dependencies]
 aqua-registry = { path = "crates/aqua-registry" }
@@ -285,6 +294,7 @@ native-tls = [
   "rattler/native-tls",
   "rattler_repodata_gateway/native-tls",
   "mise-sigstore/native-tls",
+  "mise-cache-core/native-tls",
   "ubi/native-tls",
   "vfox/native-tls",
   "xx/native-tls",
@@ -296,6 +306,7 @@ rustls = [
   "rattler/rustls",
   "rattler_repodata_gateway/rustls",
   "mise-sigstore/rustls",
+  "mise-cache-core/rustls",
   "ubi/rustls-tls",
   "vfox/rustls",
   "xx/rustls",
@@ -307,6 +318,7 @@ rustls-native-roots = [
   "rattler/rustls",
   "rattler_repodata_gateway/rustls",
   "mise-sigstore/rustls",
+  "mise-cache-core/rustls-native-roots",
   "ubi/rustls-tls",
   "vfox/rustls-native-roots",
   "xx/rustls-native-roots",

@@ -103,6 +103,10 @@ export const sidebar: SidebarItem[] = [
     items: [
       { text: "Overview", link: "/bootstrap" },
       {
+        text: "Remote Hosts",
+        link: "/bootstrap/remote",
+      },
+      {
         text: "Bootstrap Packages",
         link: "/bootstrap/packages/",
         collapsed: true,
@@ -118,6 +122,26 @@ export const sidebar: SidebarItem[] = [
             link: "/bootstrap/packages/plugins",
           },
         ],
+      },
+      {
+        text: "Linux Users and Groups",
+        link: "/bootstrap/accounts",
+      },
+      {
+        text: "System Files",
+        link: "/bootstrap/files",
+      },
+      {
+        text: "System Services",
+        link: "/bootstrap/services",
+      },
+      {
+        text: "Docker Compose Projects",
+        link: "/bootstrap/compose",
+      },
+      {
+        text: "Secret Inputs",
+        link: "/bootstrap/secrets",
       },
       {
         text: "Repos",
@@ -177,6 +201,7 @@ export const sidebar: SidebarItem[] = [
       { text: "File Tasks", link: "/tasks/file-tasks" },
       { text: "Task Arguments", link: "/tasks/task-arguments" },
       { text: "Task Configuration", link: "/tasks/task-configuration" },
+      { text: "Remote Cache Protocol", link: "/tasks/remote-cache-protocol" },
       { text: "Task Templates", link: "/tasks/templates" },
       { text: "Monorepo Tasks", link: "/tasks/monorepo" },
       { text: "Sandboxing", link: "/sandboxing" },
