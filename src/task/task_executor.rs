@@ -23,6 +23,7 @@ use crate::task::{
 };
 use crate::task::{TaskCompletionState, TaskDependencyState};
 use crate::tera::{contains_template_syntax, render_str};
+use crate::toolset::Toolset;
 use crate::toolset::env_cache::CachedEnv;
 use crate::ui::{style, time};
 use duct::IntoExecutablePath;
@@ -80,6 +81,13 @@ struct TaskRunEntriesContext<'a> {
     completion_state: &'a TaskCompletionState,
     semaphore: Arc<Semaphore>,
     permit: &'a mut Option<OwnedSemaphorePermit>,
+}
+
+struct PreparedTaskContext {
+    toolset: Toolset,
+    env: BTreeMap<String, String>,
+    task_env: Vec<(String, String)>,
+    extra_vars: Option<IndexMap<String, String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -470,181 +478,14 @@ impl TaskExecutor {
             return Ok(TaskRunOutcome::default());
         }
 
-        let mut tools = self.tool.clone();
-        tools.extend(task.tool_args()?);
-        let ts_build_start = std::time::Instant::now();
-
-        // Check if we need special handling for monorepo tasks with config file context
-        // Remote tasks (from git::/http:/https: URLs) should NOT use config file context
-        // because they need tools from the full config hierarchy, not just the local config
-        let task_cf = if task.is_remote() {
-            None
-        } else {
-            task.cf(config)
-        };
-
-        // Build toolset - either from task's config file or standard way
-        let ts = self
-            .context_builder
-            .build_toolset_for_task(config, task, task_cf, &tools)
-            .await?;
-
-        trace!(
-            "task {} ToolsetBuilder::build took {}ms",
-            task.name,
-            ts_build_start.elapsed().as_millis()
-        );
-        let env_render_start = std::time::Instant::now();
-
-        // Build environment - either from task's config file context or standard way
-        // extra_vars contains resolved vars from the task's config hierarchy (for monorepo tasks)
-        let (mut env, task_env, extra_vars) = if let Some(task_cf) = task_cf {
-            self.context_builder
-                .resolve_task_env_with_config(config, task, task_cf, &ts)
-                .await?
-        } else {
-            // Fallback to standard behavior
-            let (env, task_env) = task.render_env(config, &ts).await?;
-            (env, task_env, None)
-        };
-
-        trace!(
-            "task {} render_env took {}ms",
-            task.name,
-            env_render_start.elapsed().as_millis()
-        );
-        let mut nested_mise_diff_exclude_keys: HashSet<String> = task_env
-            .iter()
-            .map(|(key, _)| key.clone())
-            .filter(|key| key.as_str() != crate::env::PATH_KEY.as_str())
-            .chain(once("__MISE_DIFF".to_string()))
-            .collect();
-        if !self.timings {
-            Self::insert_env_excluded_from_nested_mise_diff(
-                &mut env,
-                &mut nested_mise_diff_exclude_keys,
-                "MISE_TASK_TIMINGS",
-                "0".to_string(),
-            );
-        }
-        // Propagate MISE_ENV to child tasks so -E flag works for nested mise invocations
-        if !crate::env::MISE_ENV.is_empty() {
-            Self::insert_env_excluded_from_nested_mise_diff(
-                &mut env,
-                &mut nested_mise_diff_exclude_keys,
-                "MISE_ENV",
-                crate::env::MISE_ENV.join(","),
-            );
-        }
-        if let Some(cwd) = &*crate::dirs::CWD {
-            Self::insert_env_excluded_from_nested_mise_diff(
-                &mut env,
-                &mut nested_mise_diff_exclude_keys,
-                "MISE_ORIGINAL_CWD",
-                cwd.display().to_string(),
-            );
-        }
-        // Prefer the task's own config_root so MISE_PROJECT_ROOT is the directory of the
-        // mise.toml that defined the task. This keeps the value stable regardless of the
-        // cwd from which the task was invoked (important for monorepo subprojects, where
-        // config.project_root depends on cwd).
-        //
-        // Exception: for global tasks (inline in ~/.config/mise/config.toml or scripts in
-        // ~/.config/mise/tasks/) and remote tasks (loaded from git/http), task.config_root
-        // points at the global/remote location rather than the user's project. Fall back
-        // to config.project_root (the local project the user is in) for those, matching
-        // the pre-existing behavior.
-        let project_root = if task.global || task.is_remote() {
-            config.project_root.clone().or(task.config_root.clone())
-        } else {
-            task.config_root.clone().or(config.project_root.clone())
-        };
-        if let Some(root) = project_root {
-            Self::insert_env_excluded_from_nested_mise_diff(
-                &mut env,
-                &mut nested_mise_diff_exclude_keys,
-                "MISE_PROJECT_ROOT",
-                root.display().to_string(),
-            );
-        }
-        if let Some(monorepo_root) = config.monorepo_root() {
-            Self::insert_env_excluded_from_nested_mise_diff(
-                &mut env,
-                &mut nested_mise_diff_exclude_keys,
-                "MISE_MONOREPO_ROOT",
-                monorepo_root.display().to_string(),
-            );
-        }
-        Self::insert_env_excluded_from_nested_mise_diff(
-            &mut env,
-            &mut nested_mise_diff_exclude_keys,
-            "MISE_TASK_NAME",
-            task.name.clone(),
-        );
-        let task_file = task
-            .file_path(config)
-            .await?
-            .unwrap_or(task.config_source.clone());
-        Self::insert_env_excluded_from_nested_mise_diff(
-            &mut env,
-            &mut nested_mise_diff_exclude_keys,
-            "MISE_TASK_FILE",
-            task_file.display().to_string(),
-        );
-        if let Some(dir) = task_file.parent() {
-            Self::insert_env_excluded_from_nested_mise_diff(
-                &mut env,
-                &mut nested_mise_diff_exclude_keys,
-                "MISE_TASK_DIR",
-                dir.display().to_string(),
-            );
-        }
-        if let Some(config_root) = &task.config_root {
-            Self::insert_env_excluded_from_nested_mise_diff(
-                &mut env,
-                &mut nested_mise_diff_exclude_keys,
-                "MISE_CONFIG_ROOT",
-                config_root.display().to_string(),
-            );
-        }
-
-        // Ensure cache key exists for task subprocesses for nested mise invocations
-        // This matches exec.rs behavior - enables caching for subprocesses
-        if Settings::get().env_cache {
-            let key = CachedEnv::ensure_encryption_key();
-            Self::insert_env_excluded_from_nested_mise_diff(
-                &mut env,
-                &mut nested_mise_diff_exclude_keys,
-                "__MISE_ENV_CACHE_KEY",
-                key,
-            );
-        }
-
-        // Embed __MISE_DIFF so a nested `mise` invocation inside this task can
-        // recover the pristine env (and pristine PATH) instead of stacking our
-        // tool dirs on top of its own. Keep task-scoped vars out of the diff:
-        // nested `mise hook-env` should not unset variables that belong to the
-        // currently running task.
-        let env_for_diff = self.env_for_nested_mise_diff(&env, &nested_mise_diff_exclude_keys);
-        if let Ok(serialized) =
-            EnvDiff::from_final_env(&crate::env::PRISTINE_ENV, &env_for_diff).serialize()
-        {
-            env.insert("__MISE_DIFF".into(), serialized);
-        }
-
-        let task_file = task.file_path(config).await?;
-        let usage_args = || {
-            if let Some(file) = &task_file {
-                once(file.to_string_lossy().to_string())
-                    .chain(task.args.iter().cloned())
-                    .collect()
-            } else {
-                once(String::new())
-                    .chain(task.args.iter().cloned())
-                    .collect()
-            }
-        };
-        self.parse_usage_spec_and_init_env(config, task, &mut env, usage_args, extra_vars.clone())
+        let PreparedTaskContext {
+            toolset: ts,
+            mut env,
+            task_env,
+            extra_vars,
+        } = self.prepare_task_context(config, task).await?;
+        let task_file = self
+            .parse_task_usage(config, task, &mut env, extra_vars.clone())
             .await?;
 
         // Confirmation must happen before a cache restore because restoring
@@ -1917,6 +1758,197 @@ impl TaskExecutor {
             }
         }
         Ok(())
+    }
+
+    /// Validate a task invocation before the scheduler starts any task commands.
+    /// Runtime execution repeats this work so configuration changes made while
+    /// dependencies run are still detected.
+    pub async fn preflight_task_usage(&self, config: &Arc<Config>, task: &Task) -> Result<()> {
+        let PreparedTaskContext {
+            mut env,
+            extra_vars,
+            ..
+        } = self.prepare_task_context(config, task).await?;
+        self.parse_task_usage(config, task, &mut env, extra_vars)
+            .await?;
+        Ok(())
+    }
+
+    async fn prepare_task_context(
+        &self,
+        config: &Arc<Config>,
+        task: &Task,
+    ) -> Result<PreparedTaskContext> {
+        let mut tools = self.tool.clone();
+        tools.extend(task.tool_args()?);
+        let ts_build_start = std::time::Instant::now();
+
+        // Remote tasks need tools from the full config hierarchy rather than a
+        // config file rooted at their downloaded source.
+        let task_cf = if task.is_remote() {
+            None
+        } else {
+            task.cf(config)
+        };
+        let toolset = self
+            .context_builder
+            .build_toolset_for_task(config, task, task_cf, &tools)
+            .await?;
+        trace!(
+            "task {} ToolsetBuilder::build took {}ms",
+            task.name,
+            ts_build_start.elapsed().as_millis()
+        );
+
+        let env_render_start = std::time::Instant::now();
+        // extra_vars contains resolved vars from the task's config hierarchy.
+        let (mut env, task_env, extra_vars) = if let Some(task_cf) = task_cf {
+            self.context_builder
+                .resolve_task_env_with_config(config, task, task_cf, &toolset)
+                .await?
+        } else {
+            let (env, task_env) = task.render_env(config, &toolset).await?;
+            (env, task_env, None)
+        };
+        trace!(
+            "task {} render_env took {}ms",
+            task.name,
+            env_render_start.elapsed().as_millis()
+        );
+
+        let mut nested_mise_diff_exclude_keys: HashSet<String> = task_env
+            .iter()
+            .map(|(key, _)| key.clone())
+            .filter(|key| key.as_str() != crate::env::PATH_KEY.as_str())
+            .chain(once("__MISE_DIFF".to_string()))
+            .collect();
+        if !self.timings {
+            Self::insert_env_excluded_from_nested_mise_diff(
+                &mut env,
+                &mut nested_mise_diff_exclude_keys,
+                "MISE_TASK_TIMINGS",
+                "0".to_string(),
+            );
+        }
+        if !crate::env::MISE_ENV.is_empty() {
+            Self::insert_env_excluded_from_nested_mise_diff(
+                &mut env,
+                &mut nested_mise_diff_exclude_keys,
+                "MISE_ENV",
+                crate::env::MISE_ENV.join(","),
+            );
+        }
+        if let Some(cwd) = &*crate::dirs::CWD {
+            Self::insert_env_excluded_from_nested_mise_diff(
+                &mut env,
+                &mut nested_mise_diff_exclude_keys,
+                "MISE_ORIGINAL_CWD",
+                cwd.display().to_string(),
+            );
+        }
+
+        // Prefer the task's own config root for project tasks. Global and
+        // remote tasks retain the invoking project's root.
+        let project_root = if task.global || task.is_remote() {
+            config.project_root.clone().or(task.config_root.clone())
+        } else {
+            task.config_root.clone().or(config.project_root.clone())
+        };
+        if let Some(root) = project_root {
+            Self::insert_env_excluded_from_nested_mise_diff(
+                &mut env,
+                &mut nested_mise_diff_exclude_keys,
+                "MISE_PROJECT_ROOT",
+                root.display().to_string(),
+            );
+        }
+        if let Some(monorepo_root) = config.monorepo_root() {
+            Self::insert_env_excluded_from_nested_mise_diff(
+                &mut env,
+                &mut nested_mise_diff_exclude_keys,
+                "MISE_MONOREPO_ROOT",
+                monorepo_root.display().to_string(),
+            );
+        }
+        Self::insert_env_excluded_from_nested_mise_diff(
+            &mut env,
+            &mut nested_mise_diff_exclude_keys,
+            "MISE_TASK_NAME",
+            task.name.clone(),
+        );
+        let task_file = task
+            .file_path(config)
+            .await?
+            .unwrap_or(task.config_source.clone());
+        Self::insert_env_excluded_from_nested_mise_diff(
+            &mut env,
+            &mut nested_mise_diff_exclude_keys,
+            "MISE_TASK_FILE",
+            task_file.display().to_string(),
+        );
+        if let Some(dir) = task_file.parent() {
+            Self::insert_env_excluded_from_nested_mise_diff(
+                &mut env,
+                &mut nested_mise_diff_exclude_keys,
+                "MISE_TASK_DIR",
+                dir.display().to_string(),
+            );
+        }
+        if let Some(config_root) = &task.config_root {
+            Self::insert_env_excluded_from_nested_mise_diff(
+                &mut env,
+                &mut nested_mise_diff_exclude_keys,
+                "MISE_CONFIG_ROOT",
+                config_root.display().to_string(),
+            );
+        }
+        if Settings::get().env_cache {
+            let key = CachedEnv::ensure_encryption_key();
+            Self::insert_env_excluded_from_nested_mise_diff(
+                &mut env,
+                &mut nested_mise_diff_exclude_keys,
+                "__MISE_ENV_CACHE_KEY",
+                key,
+            );
+        }
+
+        let env_for_diff = self.env_for_nested_mise_diff(&env, &nested_mise_diff_exclude_keys);
+        if let Ok(serialized) =
+            EnvDiff::from_final_env(&crate::env::PRISTINE_ENV, &env_for_diff).serialize()
+        {
+            env.insert("__MISE_DIFF".into(), serialized);
+        }
+
+        Ok(PreparedTaskContext {
+            toolset,
+            env,
+            task_env,
+            extra_vars,
+        })
+    }
+
+    async fn parse_task_usage(
+        &self,
+        config: &Arc<Config>,
+        task: &Task,
+        env: &mut BTreeMap<String, String>,
+        extra_vars: Option<IndexMap<String, String>>,
+    ) -> Result<Option<PathBuf>> {
+        let task_file = task.file_path(config).await?;
+        let usage_args = || {
+            if let Some(file) = &task_file {
+                once(file.to_string_lossy().to_string())
+                    .chain(task.args.iter().cloned())
+                    .collect()
+            } else {
+                once(String::new())
+                    .chain(task.args.iter().cloned())
+                    .collect()
+            }
+        };
+        self.parse_usage_spec_and_init_env(config, task, env, usage_args, extra_vars)
+            .await?;
+        Ok(task_file)
     }
 
     async fn parse_usage_spec_and_init_env(
