@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+
+cat <<'EOF' >mise.toml
+[tasks.dependency]
+run = 'echo dependency >> basic-runs'
+
+[tasks.parent]
+usage = 'arg "<name>"'
+depends = ["dependency"]
+run = 'echo "parent:$usage_name" >> basic-runs'
+
+[tasks.transitive-leaf]
+run = 'echo leaf >> transitive-runs'
+
+[tasks.transitive-invalid]
+usage = 'arg "<name>"'
+depends = ["transitive-leaf"]
+run = 'echo middle >> transitive-runs'
+
+[tasks.transitive-root]
+depends = ["transitive-invalid"]
+run = 'echo root >> transitive-runs'
+
+[tasks.valid-root]
+run = 'echo valid >> multi-root-runs'
+
+[tasks.invalid-root]
+usage = 'arg "<name>"'
+run = 'echo invalid >> multi-root-runs'
+
+[tasks.post-invalid]
+usage = 'arg "<name>"'
+run = 'echo post >> post-runs'
+
+[tasks.post-parent]
+depends_post = ["post-invalid"]
+run = 'echo parent >> post-runs'
+
+[tasks.wait-invalid]
+usage = 'arg "<name>"'
+run = 'echo waited >> wait-runs'
+
+[tasks.waiter]
+wait_for = ["wait-invalid"]
+run = 'echo waiter >> wait-runs'
+
+[tasks.env-arg]
+usage = 'arg "<name>" env="TASK_NAME"'
+env = { TASK_NAME = "configured" }
+run = 'echo "$usage_name"'
+
+[tasks.raw]
+raw_args = true
+usage = 'arg "<name>"'
+depends = ["raw-dependency"]
+run = 'echo "raw:$@" >> raw-runs'
+
+[tasks.raw-dependency]
+run = 'echo dependency >> raw-runs'
+
+[tasks.help-passthrough]
+usage = 'arg "<name>"'
+depends = ["help-dependency"]
+run = 'echo "help:$@" >> help-runs'
+
+[tasks.help-dependency]
+run = 'echo dependency >> help-runs'
+
+[tasks.fresh]
+usage = 'arg "<name>"'
+sources = ["source"]
+outputs = ["output"]
+run = 'echo "$usage_name" >> fresh-runs; touch output'
+EOF
+
+# Invalid root arguments are rejected before any dependency command starts.
+assert_fail_contains "mise run parent" "Missing required arg: <name>"
+test ! -e basic-runs
+
+# A valid invocation retains the normal dependency ordering and argument parsing.
+mise run parent accepted
+assert "cat basic-runs" "dependency
+parent:accepted"
+
+# A usage error in a transitive dependency prevents its own prerequisites too.
+assert_fail_contains "mise run transitive-root" "Missing required arg: <name>"
+test ! -e transitive-runs
+
+# One invalid root prevents every root in the same invocation from starting.
+assert_fail_contains "mise run valid-root ::: invalid-root" "Missing required arg: <name>"
+test ! -e multi-root-runs
+
+# Post dependencies and wait_for occurrences are part of the same preflight.
+assert_fail_contains "mise run post-parent" "Missing required arg: <name>"
+test ! -e post-runs
+assert_fail_contains "mise run waiter ::: wait-invalid" "Missing required arg: <name>"
+test ! -e wait-runs
+
+# Usage errors are invocation errors, not runtime failures handled by
+# --continue-on-error.
+assert_fail_contains "mise run --continue-on-error valid-root ::: invalid-root" \
+  "Missing required arg: <name>"
+test ! -e multi-root-runs
+
+# Task-level env is available while validating env= usage arguments.
+assert "mise run env-arg" "configured"
+
+# Compatibility escape hatches continue to bypass the usage parser.
+mise run raw --anything
+assert "cat raw-runs" "dependency
+raw: --anything"
+mise run help-passthrough -- --help
+assert "cat help-runs" "dependency
+help: --help"
+
+# Fresh tasks are still invalid invocations when required arguments are absent.
+touch source
+mise run fresh accepted
+assert_fail_contains "mise run fresh" "Missing required arg: <name>"
+assert "cat fresh-runs" "accepted"
