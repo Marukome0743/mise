@@ -6,6 +6,7 @@ use std::sync::Arc;
 use mlua::chunk::AsChunk;
 use mlua::{FromLuaMulti, IntoLua, Lua, Table, Value};
 use once_cell::sync::OnceCell;
+use url::Url;
 
 use crate::config::Config;
 use crate::context::Context;
@@ -14,6 +15,7 @@ use crate::error::Result;
 use crate::metadata::Metadata;
 use crate::runtime::Runtime;
 use crate::sdk_info::SdkInfo;
+use crate::vfox::UrlRewriter;
 use crate::{VfoxError, config, error, lua_mod};
 
 #[derive(Debug)]
@@ -136,6 +138,18 @@ impl Plugin {
             .lua
             .create_function(move |_, ()| Ok(resolver().unwrap_or_default()))?;
         self.lua.set_named_registry_value("github_token_fn", func)?;
+        Ok(())
+    }
+
+    /// Register the URL rewriter used by the Lua http module.
+    pub(crate) fn set_url_rewriter(&self, rewriter: UrlRewriter) -> Result<()> {
+        let func = self.lua.create_function(move |_, value: String| {
+            let mut url = Url::parse(&value).map_err(mlua::Error::external)?;
+            rewriter(&mut url);
+            Ok(url.to_string())
+        })?;
+        self.lua
+            .set_named_registry_value(crate::http::URL_REWRITER_REGISTRY_KEY, func)?;
         Ok(())
     }
 

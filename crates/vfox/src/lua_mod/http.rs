@@ -191,6 +191,13 @@ fn add_default_headers(lua: &Lua, url: &str, mut headers: HeaderMap) -> HeaderMa
     headers
 }
 
+fn rewrite_url(lua: &Lua, url: &str) -> Result<String> {
+    match lua.named_registry_value::<mlua::Function>(crate::http::URL_REWRITER_REGISTRY_KEY) {
+        Ok(rewriter) => rewriter.call(url),
+        Err(_) => Ok(url.to_string()),
+    }
+}
+
 async fn get(lua: &Lua, input: Table) -> Result<Table> {
     get_with_cancellation(lua, input, http_cancellation()).await
 }
@@ -207,6 +214,7 @@ async fn get_with_cancellation(
         None => HeaderMap::default(),
     };
     let headers = add_default_headers(lua, &url, headers);
+    let url = rewrite_url(lua, &url)?;
     let resp = cancel_on_signal(
         send_with_retry(CLIENT.get(&url).headers(headers)),
         cancellation.cancelled(),
@@ -228,6 +236,7 @@ async fn download_file(lua: &Lua, input: MultiValue) -> Result<()> {
         None => HeaderMap::default(),
     };
     let headers = add_default_headers(lua, &url, headers);
+    let url = rewrite_url(lua, &url)?;
     let path: String = input.iter().nth(1).unwrap().to_string()?;
     // Retry the whole flow (request + body) so a mid-stream drop restarts the
     // download instead of failing.
@@ -259,6 +268,7 @@ async fn head(lua: &Lua, input: Table) -> Result<Table> {
         None => HeaderMap::default(),
     };
     let headers = add_default_headers(lua, &url, headers);
+    let url = rewrite_url(lua, &url)?;
     let resp = cancel_on_interrupt(send_with_retry(CLIENT.head(&url).headers(headers))).await?;
     let t = lua.create_table()?;
     t.set("status_code", resp.status().as_u16())?;
@@ -282,6 +292,7 @@ async fn try_get_with_cancellation(
         None => HeaderMap::default(),
     };
     let headers = add_default_headers(lua, &url, headers);
+    let url = rewrite_url(lua, &url)?;
     let resp = match cancel_on_signal(
         send_with_retry(CLIENT.get(&url).headers(headers)),
         cancellation.cancelled(),
@@ -318,6 +329,7 @@ async fn try_head(lua: &Lua, input: Table) -> Result<MultiValue> {
         None => HeaderMap::default(),
     };
     let headers = add_default_headers(lua, &url, headers);
+    let url = rewrite_url(lua, &url)?;
     let resp = match cancel_on_interrupt(send_with_retry(CLIENT.head(&url).headers(headers))).await
     {
         Ok(resp) => resp,
@@ -350,6 +362,7 @@ async fn try_download_file(lua: &Lua, input: MultiValue) -> Result<MultiValue> {
         None => HeaderMap::default(),
     };
     let headers = add_default_headers(lua, &url, headers);
+    let url = rewrite_url(lua, &url)?;
     let path = match input.get(1).and_then(|v| v.to_string().ok()) {
         Some(p) => p,
         None => {
@@ -498,6 +511,90 @@ mod tests {
         .exec_async()
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn test_rewrite_url_defaults_to_original() {
+        let lua = Lua::new();
+        let url = "https://upstream.example/resource";
+        assert_eq!(rewrite_url(&lua, url).unwrap(), url);
+    }
+
+    #[tokio::test]
+    async fn test_url_rewriter_applies_to_all_lua_http_methods() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/resource"))
+            .and(header("Authorization", "Bearer original-host"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("rewritten"))
+            .expect(4)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/resource"))
+            .and(header("Authorization", "Bearer original-host"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let lua = Lua::new();
+        mod_http(&lua).unwrap();
+        lua.set_named_registry_value("github_token", "original-host")
+            .unwrap();
+        let replacement_origin = server.uri();
+        let rewriter = lua
+            .create_function(move |_, url: String| {
+                Ok(url.replacen("https://api.github.com", &replacement_origin, 1))
+            })
+            .unwrap();
+        lua.set_named_registry_value(crate::http::URL_REWRITER_REGISTRY_KEY, rewriter)
+            .unwrap();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let download_path = temp_dir.path().join("download.txt");
+        let try_download_path = temp_dir.path().join("try-download.txt");
+        let download_path_str = download_path.to_string_lossy().to_string();
+        let try_download_path_str = try_download_path.to_string_lossy().to_string();
+        let url = "https://api.github.com/resource";
+
+        lua.load(mlua::chunk! {
+            local http = require("http")
+
+            local get_resp = http.get({ url = $url })
+            assert(get_resp.status_code == 200)
+            assert(get_resp.body == "rewritten")
+
+            local try_get_resp, try_get_err = http.try_get({ url = $url })
+            assert(try_get_err == nil)
+            assert(try_get_resp.body == "rewritten")
+
+            assert(http.head({ url = $url }).status_code == 200)
+            local try_head_resp, try_head_err = http.try_head({ url = $url })
+            assert(try_head_err == nil)
+            assert(try_head_resp.status_code == 200)
+
+            assert(http.download_file({ url = $url }, $download_path_str) == nil)
+            local ok, try_download_err = http.try_download_file(
+                { url = $url },
+                $try_download_path_str
+            )
+            assert(ok == true)
+            assert(try_download_err == nil)
+        })
+        .exec_async()
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(download_path).await.unwrap(),
+            "rewritten"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(try_download_path).await.unwrap(),
+            "rewritten"
+        );
     }
 
     #[tokio::test]
