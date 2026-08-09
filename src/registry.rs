@@ -124,6 +124,21 @@ pub struct RegistryTool {
     pub os: &'static [&'static str],
     pub idiomatic_files: &'static [RegistryIdiomaticFile],
     pub detect: &'static [&'static str],
+    pub depends: &'static [&'static str],
+    pub env_paths: &'static [RegistryEnvPath],
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistryEnvPath {
+    pub name: &'static str,
+    pub paths: &'static [&'static str],
+    pub os: &'static [&'static str],
+}
+
+impl RegistryEnvPath {
+    pub fn is_supported_os(&self) -> bool {
+        self.os.is_empty() || self.os.contains(&OS)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -355,6 +370,8 @@ fn parse_registry_tool(short: &str, value: &toml::Value) -> Result<RegistryTool>
     let os = string_array(table.get("os"), "os")?;
     let idiomatic_files = parse_registry_idiomatic_files(table.get("idiomatic_files"))?;
     let detect = string_array(table.get("detect"), "detect")?;
+    let depends = string_array(table.get("depends"), "depends")?;
+    let env_paths = parse_registry_env_paths(table.get("env_paths"))?;
     let description = table
         .get("description")
         .map(|value| {
@@ -377,7 +394,45 @@ fn parse_registry_tool(short: &str, value: &toml::Value) -> Result<RegistryTool>
         os: leak_vec(os),
         idiomatic_files: leak_vec(idiomatic_files),
         detect: leak_vec(detect),
+        depends: leak_vec(depends),
+        env_paths: leak_vec(env_paths),
     })
+}
+
+fn parse_registry_env_paths(value: Option<&toml::Value>) -> Result<Vec<RegistryEnvPath>> {
+    value
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| eyre::eyre!("env_paths must be an array"))?
+                .iter()
+                .map(|value| {
+                    let table = value
+                        .as_table()
+                        .ok_or_else(|| eyre::eyre!("env_paths entries must be tables"))?;
+                    for key in table.keys() {
+                        ensure!(
+                            matches!(key.as_str(), "name" | "paths" | "os"),
+                            "unknown env_paths field: {key}"
+                        );
+                    }
+                    let name = table
+                        .get("name")
+                        .and_then(toml::Value::as_str)
+                        .ok_or_else(|| eyre::eyre!("env_paths.name must be a string"))?;
+                    let paths = string_array(table.get("paths"), "env_paths.paths")?;
+                    ensure!(!paths.is_empty(), "env_paths.paths must not be empty");
+                    let os = string_array(table.get("os"), "env_paths.os")?;
+                    Ok(RegistryEnvPath {
+                        name: leak_string(name.to_string()),
+                        paths: leak_vec(paths),
+                        os: leak_vec(os),
+                    })
+                })
+                .collect()
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 fn parse_registry_idiomatic_files(
@@ -789,6 +844,11 @@ mod tests {
 aliases = ["example-alias"]
 description = "Example tool"
 bins = ["example", "example-helper"]
+depends = ["runtime"]
+env_paths = [
+  { name = "EXAMPLE_HOME", paths = ["."] },
+  { name = "LD_LIBRARY_PATH", paths = ["lib"], os = ["linux"] },
+]
 backends = [
   "aqua:example/tool",
   { full = "github:example/tool", platforms = ["linux-x64"], options = { bin = "example" } },
@@ -808,6 +868,11 @@ test = { cmd = "example --version", expected = "{{version}}", tools = ["node"] }
         assert_eq!(tool.short, "example");
         assert_eq!(tool.description, Some("Example tool"));
         assert_eq!(tool.bins, &["example", "example-helper"]);
+        assert_eq!(tool.depends, &["runtime"]);
+        assert_eq!(tool.env_paths[0].name, "EXAMPLE_HOME");
+        assert_eq!(tool.env_paths[0].paths, &["."]);
+        assert!(tool.env_paths[0].os.is_empty());
+        assert_eq!(tool.env_paths[1].os, &["linux"]);
         assert!(tool.provides_bin("example"));
         assert!(!tool.provides_bin("other"));
         if cfg!(windows) {
@@ -1060,6 +1125,8 @@ idiomatic_files = [{ path = ".example-version", parser = "shell" }]
             os: &[],
             idiomatic_files: &[],
             detect: &[],
+            depends: &[],
+            env_paths: &[],
         };
 
         let opts = tool.backend_options("github:owner/repo");

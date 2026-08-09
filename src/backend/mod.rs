@@ -1695,6 +1695,9 @@ pub trait Backend: Debug + Send + Sync {
             return Ok(Default::default());
         }
         let mut deps: Vec<&str> = self.get_dependencies()?;
+        if let Some(tool) = REGISTRY.get(self.ba().short.as_str()) {
+            deps.extend(tool.depends);
+        }
         if optional {
             deps.extend(self.get_optional_dependencies()?);
         }
