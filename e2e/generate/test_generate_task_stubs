@@ -3,3 +3,60 @@
 assert "mise tasks add xxx -- echo 'running xxx'"
 assert "mise generate task-stubs"
 assert "./bin/xxx" "running xxx"
+
+mkdir -p .mise/tasks/work/containers
+cat >.mise/tasks/work/containers/_default <<'EOF'
+#!/bin/sh
+echo parent
+EOF
+cat >.mise/tasks/work/containers/pg <<'EOF'
+#!/bin/sh
+echo pg
+EOF
+cat >.mise/tasks/work/containers/redis <<'EOF'
+#!/bin/sh
+echo redis
+EOF
+chmod +x .mise/tasks/work/containers/{_default,pg,redis}
+
+assert "mise generate task-stubs"
+test -x bin/work/containers/_default
+test -x bin/work/containers/pg
+test -x bin/work/containers/redis
+assert "bin/work/containers/_default" "parent"
+assert "bin/work/containers/pg" "pg"
+assert "bin/work/containers/redis" "redis"
+assert "mise generate task-stubs"
+
+cat >.mise/tasks/legacy <<'EOF'
+#!/bin/sh
+echo legacy
+EOF
+chmod +x .mise/tasks/legacy
+assert "mise generate task-stubs --dir legacy-bin"
+test -f legacy-bin/legacy
+
+rm .mise/tasks/legacy
+mkdir .mise/tasks/legacy
+cat >.mise/tasks/legacy/_default <<'EOF'
+#!/bin/sh
+echo legacy
+EOF
+cat >.mise/tasks/legacy/child <<'EOF'
+#!/bin/sh
+echo child
+EOF
+chmod +x .mise/tasks/legacy/{_default,child}
+assert "mise generate task-stubs --dir legacy-bin"
+test -d legacy-bin/legacy
+test -x legacy-bin/legacy/_default
+test -x legacy-bin/legacy/child
+assert "legacy-bin/legacy/_default" "legacy"
+assert "legacy-bin/legacy/child" "child"
+
+mkdir -p blocked-bin
+echo "user-owned" >blocked-bin/work
+assert_fail_contains \
+  "mise generate task-stubs --dir blocked-bin" \
+  "blocked-bin/work is not a directory"
+test ! -e blocked-bin/xxx
