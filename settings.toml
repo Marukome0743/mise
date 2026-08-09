@@ -1330,7 +1330,7 @@ type = "String"
 
 [jobs]
 default = 8
-description = "How many jobs to run concurrently such as tool installs."
+description = "How many jobs to run concurrently such as tool installs. Values below 1 are treated as 1."
 env = "MISE_JOBS"
 rust_type = "usize"
 type = "Integer"
@@ -3150,6 +3150,20 @@ description = "Default shell arguments for Unix to be used for inline commands. 
 env = "MISE_UNIX_DEFAULT_INLINE_SHELL_ARGS"
 global_only = true
 type = "String"
+
+[upgrade.auto_prune]
+default = true
+description = "Uninstall the version `mise upgrade` replaced once the new one has installed."
+docs = """
+`mise upgrade` removes the version it upgraded away from, deleting its install directory. Set this
+to `false` when something outside of mise resolves through that path — a virtualenv built from a
+mise-managed interpreter, for example — and the old version is left in place instead.
+
+Versions that another tracked config or tool stub still needs are kept regardless of this setting.
+`mise upgrade --prune` overrides it for a single run, and `--no-prune` does the opposite.
+"""
+env = "MISE_UPGRADE_AUTO_PRUNE"
+type = "Bool"
 
 [url_replacements]
 description = "Map of URL patterns to replacement URLs applied to all requests."

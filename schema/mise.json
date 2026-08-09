@@ -1161,7 +1161,7 @@
         },
         "jobs": {
           "default": 8,
-          "description": "How many jobs to run concurrently such as tool installs.",
+          "description": "How many jobs to run concurrently such as tool installs. Values below 1 are treated as 1.",
           "type": "integer"
         },
         "legacy_version_file": {
@@ -2048,6 +2048,17 @@
           "default": "sh -c -o errexit",
           "description": "Default shell arguments for Unix to be used for inline commands. For example, `sh -c` for sh.",
           "type": "string"
+        },
+        "upgrade": {
+          "type": "object",
+          "unevaluatedProperties": false,
+          "properties": {
+            "auto_prune": {
+              "default": true,
+              "description": "Uninstall the version `mise upgrade` replaced once the new one has installed.",
+              "type": "boolean"
+            }
+          }
         },
         "url_replacements": {
           "description": "Map of URL patterns to replacement URLs applied to all requests.",
