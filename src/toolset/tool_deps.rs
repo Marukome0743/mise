@@ -131,6 +131,53 @@ mod tests {
         let _deps = ToolDeps::new(vec![]).unwrap();
     }
 
+    #[test]
+    fn test_registry_dependencies_order_configured_tools() {
+        let source = ToolSource::Argument;
+        let haxe = ToolRequest::Version {
+            backend: Arc::new(BackendArg::new(
+                "haxe".to_string(),
+                Some("github:HaxeFoundation/haxe".to_string()),
+            )),
+            version: "4.3.7".to_string(),
+            options: ToolVersionOptions::default(),
+            source: source.clone(),
+        };
+        let neko = ToolRequest::Version {
+            backend: Arc::new(BackendArg::new(
+                "neko".to_string(),
+                Some("github:HaxeFoundation/neko".to_string()),
+            )),
+            version: "2-4-1".to_string(),
+            options: ToolVersionOptions::default(),
+            source,
+        };
+
+        let mut deps = ToolDeps::new(vec![haxe.clone(), neko.clone()]).unwrap();
+        let mut rx = deps.subscribe();
+        assert_eq!(rx.try_recv().unwrap().unwrap().ba().short, "neko");
+        assert!(rx.try_recv().is_err());
+        deps.complete_success(&neko);
+        assert_eq!(rx.try_recv().unwrap().unwrap().ba().short, "haxe");
+    }
+
+    #[test]
+    fn test_registry_dependencies_do_not_add_missing_tools() {
+        let haxe = ToolRequest::Version {
+            backend: Arc::new(BackendArg::new(
+                "haxe".to_string(),
+                Some("github:HaxeFoundation/haxe".to_string()),
+            )),
+            version: "4.3.7".to_string(),
+            options: ToolVersionOptions::default(),
+            source: ToolSource::Argument,
+        };
+
+        let mut deps = ToolDeps::new(vec![haxe]).unwrap();
+        let mut rx = deps.subscribe();
+        assert_eq!(rx.try_recv().unwrap().unwrap().ba().short, "haxe");
+    }
+
     #[tokio::test]
     async fn test_aliases_to_same_backend_are_distinct() {
         let _config = Config::get().await.unwrap();
