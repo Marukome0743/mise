@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::dirs;
 use crate::env;
 use crate::request_exit;
+use crate::task::task_context_builder::TaskContextBuilder;
 use crate::task::task_source_checker::task_cwd;
 use crate::task::{Deps, Task};
 use crate::toolset::ToolsetBuilder;
@@ -85,11 +86,26 @@ impl Watch {
         if args.is_empty() {
             bail!("No tasks specified");
         }
-        let tasks = crate::task::task_list::get_task_lists(&config, &args, false, false).await?;
+        let mut tasks =
+            crate::task::task_list::get_task_lists(&config, &args, false, false).await?;
+        let context_builder = TaskContextBuilder::new();
         let watched_tasks = if self.skip_deps {
+            for task in &mut tasks {
+                context_builder
+                    .render_task_file_templates(&config, task, &[])
+                    .await?;
+            }
             tasks.to_vec()
         } else {
-            let deps = Deps::new(&config, tasks.clone()).await?;
+            let mut deps = Deps::new(&config, tasks.clone()).await?;
+            let node_indices = deps.graph.node_indices().collect_vec();
+            for idx in node_indices {
+                let mut task = deps.graph[idx].clone();
+                context_builder
+                    .render_task_file_templates(&config, &mut task, &[])
+                    .await?;
+                deps.graph[idx] = task;
+            }
             deps.all().cloned().collect()
         };
         let mut args = vec![];

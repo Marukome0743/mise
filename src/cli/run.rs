@@ -853,7 +853,7 @@ impl Run {
         time!("parallelize_tasks start");
 
         // Step 1: Prepare tasks (resolve dependencies, fetch, validate)
-        let tasks = self.prepare_tasks(&config, tasks).await?;
+        let mut tasks = self.prepare_tasks(&config, tasks).await?;
         let num_tasks = tasks.all().count();
 
         // Step 2: Setup output handler and validate tasks
@@ -864,6 +864,21 @@ impl Run {
         if !self.skip_tools {
             self.install_task_tools(&mut config, &tasks, &previewed_tools)
                 .await?;
+        }
+
+        // Source/output patterns may depend on this occurrence's parsed task
+        // arguments. Render them after task tools and environment are available,
+        // but before freshness checks, cache preparation, or the scheduler.
+        let node_indices = tasks.graph.node_indices().collect_vec();
+        for idx in node_indices {
+            let mut task = tasks.graph[idx].clone();
+            self.context_builder
+                .render_task_file_templates(&config, &mut task, &self.tool)
+                .await
+                .wrap_err_with(|| {
+                    format!("failed to render sources/outputs for task {}", task.name)
+                })?;
+            tasks.graph[idx] = task;
         }
 
         // Step 4: Bracket action caching with this top-level task run. The
