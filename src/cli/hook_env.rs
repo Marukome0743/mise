@@ -13,7 +13,7 @@ use console::truncate_str;
 use eyre::Result;
 use indexmap::IndexSet;
 use itertools::Itertools;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::{borrow::Cow, sync::Arc};
@@ -291,65 +291,12 @@ impl HookEnv {
         let (pre, post, post_user) = match &*env::__MISE_ORIG_PATH {
             Some(orig_path) if !Settings::get().activate_aggressive => {
                 let orig_paths: Vec<PathBuf> = split_paths(orig_path).collect();
-                let orig_set: HashSet<_> = orig_paths.iter().collect();
-
-                // Get all mise-managed paths from the previous session
-                // to_remove contains ALL paths that mise added (tool installs, config paths, etc.)
                 let mise_paths_set: HashSet<_> = to_remove.iter().collect();
-
-                // Find paths in current that are not in original and not mise-managed.
-                // Split them into "pre" (before the original PATH entries) and "post_user"
-                // (after the original PATH entries) to preserve their intended position.
-                // This prevents paths appended after `mise activate` in shell rc from
-                // being moved to the front of PATH.
-                //
-                // Also collect orig paths in their current order to preserve any
-                // reordering done after activation (e.g., by ~/.zlogin which runs
-                // after ~/.zshrc where mise activate is typically placed).
-                let mut pre = Vec::new();
-                let mut post_user = Vec::new();
-                let mut orig_reordered = Vec::new();
-                let mut seen_orig = false;
-                let mut seen_in_current: HashSet<&PathBuf> = HashSet::new();
                 let mise_install_dirs = crate::path_env::mise_install_dirs();
-                for path in &current_paths {
-                    if orig_set.contains(path) {
-                        seen_orig = true;
-                        orig_reordered.push(path.clone());
-                        seen_in_current.insert(path);
-                        continue;
-                    }
-
-                    // Skip if it's a mise-managed path from previous session
-                    if mise_paths_set.contains(path) {
-                        continue;
-                    }
-
-                    // Paths under mise's installs dir are mise-managed even if
-                    // the previous session diff did not claim them. Preserving a
-                    // stale install path as a user prefix can shadow the active
-                    // version selected by the current toolset.
-                    if crate::path_env::is_mise_install_path(path, &mise_install_dirs) {
-                        continue;
-                    }
-
-                    // Place in pre or post_user based on position relative to original PATH
-                    if seen_orig {
-                        post_user.push(path.clone());
-                    } else {
-                        pre.push(path.clone());
-                    }
-                }
-
-                // Append any orig paths that are no longer in current PATH
-                // (to avoid losing paths that may have been temporarily removed)
-                for path in &orig_paths {
-                    if !seen_in_current.contains(path) {
-                        orig_reordered.push(path.clone());
-                    }
-                }
-
-                (pre, orig_reordered, post_user)
+                partition_path_entries(&current_paths, &orig_paths, |path| {
+                    mise_paths_set.contains(path)
+                        || crate::path_env::is_mise_install_path(path, &mise_install_dirs)
+                })
             }
             _ => (vec![], current_paths, vec![]),
         };
@@ -547,6 +494,105 @@ impl HookEnv {
     }
 }
 
+fn partition_path_entries(
+    current_paths: &[PathBuf],
+    orig_paths: &[PathBuf],
+    is_mise_managed: impl Fn(&PathBuf) -> bool,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let current_paths: Vec<&PathBuf> = current_paths
+        .iter()
+        .filter(|path| !is_mise_managed(path))
+        .collect();
+
+    // Match the original PATH as an ordered subsequence of the current PATH.
+    // Backtracking from the end deliberately chooses the later occurrence when
+    // duplicate matches are equivalent. This leaves a duplicate prepended after
+    // activation unclaimed instead of mistaking it for the captured original.
+    let mut lengths = vec![vec![0usize; current_paths.len() + 1]; orig_paths.len() + 1];
+    for (orig_idx, orig) in orig_paths.iter().enumerate() {
+        for (current_idx, current) in current_paths.iter().enumerate() {
+            lengths[orig_idx + 1][current_idx + 1] = if orig == *current {
+                lengths[orig_idx][current_idx] + 1
+            } else {
+                lengths[orig_idx][current_idx + 1].max(lengths[orig_idx + 1][current_idx])
+            };
+        }
+    }
+
+    let mut original_occurrences = vec![false; current_paths.len()];
+    let mut orig_idx = orig_paths.len();
+    let mut current_idx = current_paths.len();
+    while orig_idx > 0 && current_idx > 0 {
+        if orig_paths[orig_idx - 1] == *current_paths[current_idx - 1]
+            && lengths[orig_idx][current_idx] == lengths[orig_idx - 1][current_idx - 1] + 1
+        {
+            original_occurrences[current_idx - 1] = true;
+            orig_idx -= 1;
+            current_idx -= 1;
+        } else if lengths[orig_idx - 1][current_idx] > lengths[orig_idx][current_idx - 1] {
+            orig_idx -= 1;
+        } else {
+            current_idx -= 1;
+        }
+    }
+
+    let mut remaining: HashMap<&PathBuf, usize> = HashMap::new();
+    for path in orig_paths {
+        *remaining.entry(path).or_default() += 1;
+    }
+    for (idx, path) in current_paths.iter().enumerate() {
+        if original_occurrences[idx]
+            && let Some(count) = remaining.get_mut(path)
+        {
+            *count -= 1;
+        }
+    }
+
+    // Original entries may have been reordered after activation. Recover those
+    // occurrences without allowing extra duplicates to exceed the captured count.
+    for (idx, path) in current_paths.iter().enumerate().rev() {
+        if !original_occurrences[idx]
+            && let Some(count) = remaining.get_mut(path)
+            && *count > 0
+        {
+            original_occurrences[idx] = true;
+            *count -= 1;
+        }
+    }
+
+    let first_original = original_occurrences.iter().position(|matched| *matched);
+    let original_set: HashSet<&PathBuf> = orig_paths.iter().collect();
+    let mut pre = Vec::new();
+    let mut post = Vec::new();
+    let mut post_user = Vec::new();
+    for (idx, path) in current_paths.iter().enumerate() {
+        if original_occurrences[idx] {
+            post.push((*path).clone());
+        } else if original_set.contains(path) {
+            // This occurrence exceeds the number captured at activation, so it
+            // is a duplicate restatement rather than a separate PATH entry.
+            continue;
+        } else if first_original.is_some_and(|first| idx > first) {
+            post_user.push((*path).clone());
+        } else {
+            pre.push((*path).clone());
+        }
+    }
+
+    // Preserve the existing safety fallback for original entries that are no
+    // longer present in the current PATH.
+    for path in orig_paths {
+        if let Some(count) = remaining.get_mut(path)
+            && *count > 0
+        {
+            post.push(path.clone());
+            *count -= 1;
+        }
+    }
+
+    (pre, post, post_user)
+}
+
 fn patch_to_status(patch: EnvDiffOperation) -> String {
     match patch {
         EnvDiffOperation::Add(k, _) => format!("+{k}"),
@@ -560,5 +606,101 @@ fn format_status(status: &str) -> Cow<'_, str> {
         truncate_str(status, TERM_WIDTH.max(60) - 5, "…")
     } else {
         status.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn paths(values: &[&str]) -> Vec<PathBuf> {
+        values.iter().map(PathBuf::from).collect()
+    }
+
+    fn partition(
+        current: &[&str],
+        original: &[&str],
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+        partition_path_entries(&paths(current), &paths(original), |_| false)
+    }
+
+    #[test]
+    fn path_partition_discards_prepended_original_duplicate() {
+        let current = paths(&["B", "original", "A", "managed", "original", "system"]);
+        let captured = paths(&["original", "system"]);
+        let (pre, original, post_user) =
+            partition_path_entries(&current, &captured, |path| path == Path::new("managed"));
+
+        assert_eq!(pre, paths(&["B", "A"]));
+        assert_eq!(original, paths(&["original", "system"]));
+        assert!(post_user.is_empty());
+    }
+
+    #[test]
+    fn path_partition_keeps_duplicate_free_order() {
+        let (pre, original, post_user) =
+            partition(&["B", "A", "original", "system"], &["original", "system"]);
+
+        assert_eq!(pre, paths(&["B", "A"]));
+        assert_eq!(original, paths(&["original", "system"]));
+        assert!(post_user.is_empty());
+    }
+
+    #[test]
+    fn path_partition_preserves_original_duplicates() {
+        let (pre, original, post_user) = partition(
+            &["B", "original", "original", "system"],
+            &["original", "original", "system"],
+        );
+
+        assert_eq!(pre, paths(&["B"]));
+        assert_eq!(original, paths(&["original", "original", "system"]));
+        assert!(post_user.is_empty());
+    }
+
+    #[test]
+    fn path_partition_discards_appended_original_duplicate() {
+        let (pre, original, post_user) = partition(
+            &["original", "system", "original", "appended"],
+            &["original", "system"],
+        );
+
+        assert!(pre.is_empty());
+        assert_eq!(original, paths(&["original", "system"]));
+        assert_eq!(post_user, paths(&["appended"]));
+    }
+
+    #[test]
+    fn path_partition_preserves_reordered_original_entries() {
+        let (pre, original, post_user) = partition(
+            &["system", "original", "other"],
+            &["original", "other", "system"],
+        );
+
+        assert!(pre.is_empty());
+        assert_eq!(original, paths(&["system", "original", "other"]));
+        assert!(post_user.is_empty());
+    }
+
+    #[test]
+    fn path_partition_appends_missing_original_entries() {
+        let (pre, original, post_user) = partition(&["B", "original"], &["original", "missing"]);
+
+        assert_eq!(pre, paths(&["B"]));
+        assert_eq!(original, paths(&["original", "missing"]));
+        assert!(post_user.is_empty());
+    }
+
+    #[test]
+    fn path_partition_ignores_mise_managed_entries() {
+        let current = paths(&["B", "managed", "original", "system"]);
+        let original = paths(&["original", "system"]);
+        let (pre, original, post_user) =
+            partition_path_entries(&current, &original, |path| path == Path::new("managed"));
+
+        assert_eq!(pre, paths(&["B"]));
+        assert_eq!(original, paths(&["original", "system"]));
+        assert!(post_user.is_empty());
     }
 }
