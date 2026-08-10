@@ -18,6 +18,13 @@ type EnvResolutionResult = (
     Option<IndexMap<String, String>>,
 );
 
+pub(crate) struct ResolvedTaskContext {
+    pub(crate) toolset: Toolset,
+    pub(crate) env: BTreeMap<String, String>,
+    pub(crate) task_env: Vec<(String, String)>,
+    pub(crate) extra_vars: Option<IndexMap<String, String>>,
+}
+
 /// Builds toolset and environment context for task execution
 ///
 /// Handles:
@@ -50,6 +57,91 @@ impl TaskContextBuilder {
             tool_request_set_cache: RwLock::new(IndexMap::new()),
             env_resolution_cache: RwLock::new(IndexMap::new()),
         }
+    }
+
+    /// Resolve the same task-local toolset, environment, and vars used during
+    /// execution, then render argument-dependent source/output patterns before
+    /// freshness checks or watch filter construction.
+    pub async fn render_task_file_templates(
+        &self,
+        config: &Arc<Config>,
+        task: &mut Task,
+        cli_tools: &[ToolArg],
+    ) -> Result<()> {
+        if !task.has_usage_file_templates() {
+            return Ok(());
+        }
+        let context = self.resolve_task_context(config, task, cli_tools).await?;
+        task.render_file_templates_with_args(config, &context.env, context.extra_vars)
+            .await
+    }
+
+    /// Resolve the task-local toolset and environment shared by file-template
+    /// rendering and task execution.
+    pub(crate) async fn resolve_task_context(
+        &self,
+        config: &Arc<Config>,
+        task: &Task,
+        cli_tools: &[ToolArg],
+    ) -> Result<ResolvedTaskContext> {
+        let mut tools = cli_tools.to_vec();
+        tools.extend(task.tool_args()?);
+        let task_cf = if task.is_remote() {
+            None
+        } else {
+            task.cf(config).cloned()
+        };
+        let toolset = self
+            .build_toolset_for_task(config, task, task_cf.as_ref(), &tools)
+            .await?;
+        let (mut env, task_env, extra_vars) = if let Some(task_cf) = task_cf.as_ref() {
+            self.resolve_task_env_with_config(config, task, task_cf, &toolset)
+                .await?
+        } else {
+            let (env, task_env) = task.render_env(config, &toolset).await?;
+            (env, task_env, None)
+        };
+        Self::inject_task_metadata(config, task, &mut env).await?;
+        Ok(ResolvedTaskContext {
+            toolset,
+            env,
+            task_env,
+            extra_vars,
+        })
+    }
+
+    async fn inject_task_metadata(
+        config: &Arc<Config>,
+        task: &Task,
+        env: &mut BTreeMap<String, String>,
+    ) -> Result<()> {
+        let project_root = if task.global || task.is_remote() {
+            config.project_root.clone().or(task.config_root.clone())
+        } else {
+            task.config_root.clone().or(config.project_root.clone())
+        };
+        if let Some(root) = project_root {
+            env.insert("MISE_PROJECT_ROOT".into(), root.display().to_string());
+        }
+        if let Some(monorepo_root) = config.monorepo_root() {
+            env.insert(
+                "MISE_MONOREPO_ROOT".into(),
+                monorepo_root.display().to_string(),
+            );
+        }
+        env.insert("MISE_TASK_NAME".into(), task.name.clone());
+        let task_file = task
+            .file_path(config)
+            .await?
+            .unwrap_or(task.config_source.clone());
+        env.insert("MISE_TASK_FILE".into(), task_file.display().to_string());
+        if let Some(dir) = task_file.parent() {
+            env.insert("MISE_TASK_DIR".into(), dir.display().to_string());
+        }
+        if let Some(config_root) = &task.config_root {
+            env.insert("MISE_CONFIG_ROOT".into(), config_root.display().to_string());
+        }
+        Ok(())
     }
 
     /// Build toolset for a task, with caching for monorepo tasks
