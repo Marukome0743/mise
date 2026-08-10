@@ -35,7 +35,7 @@ where
 
     let (age, age_key_file) = resolve_age_key(exec_env, &mut parse_template);
 
-    if age.is_none() && !Settings::get().sops.strict {
+    if use_rops && age.is_none() && !Settings::get().sops.strict {
         debug!("age key not found, skipping decryption in non-strict mode");
         return Ok(String::new());
     }
