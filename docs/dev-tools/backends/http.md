@@ -461,10 +461,17 @@ The HTTP backend implements an intelligent caching system to optimize disk usage
 
 ### Cache Location
 
-Downloaded and extracted files are cached in `$MISE_CACHE_DIR/http-tarballs/` instead of being stored separately for each tool installation. By default:
+For normal user installations, downloaded and extracted files are cached in
+`$MISE_DATA_DIR/http-tarballs/` instead of being stored separately for each tool
+installation. By default:
 
-- **Linux**: `~/.cache/mise/http-tarballs/`
-- **macOS**: `~/Library/Caches/mise/http-tarballs/`
+- **Linux**: `~/.local/share/mise/http-tarballs/`
+- **macOS**: `~/.local/share/mise/http-tarballs/`
+
+Explicit `mise install --system` and `mise install --shared` installations keep
+their cache in `<INSTALLS>/<TOOL>/.http-tarballs/`. This makes the shared
+installation self-contained instead of linking it to the installing user's home
+directory.
 
 ### Cache Key Generation
 
@@ -476,14 +483,12 @@ Cache keys are generated based on the file content to ensure identical downloads
 Example cache directory structure:
 
 ```
-~/.cache/mise/http-tarballs/
+~/.local/share/mise/http-tarballs/
 ├── 71f774faa03daf1a58cc3339f8c73e6557348c8e0a2f3fb8148cc26e26bad83f/
-│   ├── extracted/
-│   │   └── bin/my-tool
+│   ├── bin/my-tool
 │   └── metadata.json
 └── 1c2af379bdf1fed266bc44b49271e2df5b0dafae09f1cc744b3505ec50c84719_strip_1/
-    ├── extracted/
-    │   └── my-tool
+    ├── my-tool
     └── metadata.json
 ```
 
@@ -492,12 +497,14 @@ Example cache directory structure:
 Tool installations are symlinks to the cached extracted content:
 
 ```bash
-~/.local/share/mise/installs/http-my-tool/1.0.0 → ~/.cache/mise/http-tarballs/71f774.../extracted
+~/.local/share/mise/installs/http-my-tool/1.0.0 → ~/.local/share/mise/http-tarballs/71f774...
+
+/usr/local/share/mise/installs/http-my-tool/1.0.0 → /usr/local/share/mise/installs/http-my-tool/.http-tarballs/71f774...
 ```
 
 This approach provides several benefits:
 
-- **Space efficiency**: Multiple tools using the same tarball share a single cached copy
+- **Space efficiency**: Normal user installs share identical tarballs across tools; system/shared installs reuse them within each tool
 - **Faster installations**: Cache hits avoid re-downloading and re-extracting files
 - **Consistency**: Identical file content always uses the same cache entry
 
