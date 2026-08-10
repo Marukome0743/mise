@@ -683,6 +683,12 @@ impl DepsEngine {
 
         // Run stale providers with dependency ordering
         if !to_run.is_empty() {
+            // Retain the fingerprint of the exact command that will run. Rebuilding
+            // commands after execution could observe a concurrently changed config.
+            let command_hashes: HashMap<String, String> = to_run
+                .iter()
+                .map(|job| (job.id.clone(), job.cmd.freshness_hash()))
+                .collect();
             let has_deps = to_run.iter().any(|j| !j.depends.is_empty());
 
             if has_deps {
@@ -725,6 +731,9 @@ impl DepsEngine {
                         let provider_id = provider.base().id.as_str();
                         st.set_hashes(provider_id, hashes);
                         st.set_seen_outputs(provider_id, seen);
+                        if let Some(command_hash) = command_hashes.get(provider_id) {
+                            st.set_command_hash(provider_id, command_hash.clone());
+                        }
                         if let Err(e) = st.save(project_root) {
                             warn!("failed to save deps state: {e}");
                         }
@@ -1038,6 +1047,28 @@ impl DepsEngine {
             return Ok(FreshnessResult::Stale(
                 "no sources or outputs defined".to_string(),
             ));
+        }
+
+        let command_hash = provider.install_command()?.freshness_hash();
+        match st.get_command_hash(provider_id) {
+            Some(stored_hash) if stored_hash != command_hash => {
+                return Ok(FreshnessResult::Stale(
+                    "provider command changed".to_string(),
+                ));
+            }
+            Some(_) => {}
+            None if st.get_hashes(provider_id).is_some()
+                || st.get_seen_outputs(provider_id).is_some() =>
+            {
+                // State written by mise versions before command hashing cannot prove
+                // that the provider definition is unchanged. Re-run it once to migrate.
+                return Ok(FreshnessResult::Stale(
+                    "provider command changed".to_string(),
+                ));
+            }
+            None => {
+                return Ok(FreshnessResult::Stale("no previous state".to_string()));
+            }
         }
 
         if sources.is_empty() {
