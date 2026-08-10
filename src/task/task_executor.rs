@@ -416,6 +416,7 @@ impl TaskExecutor {
             if sandbox.effective_deny_env() {
                 sandbox.pass_through_env.extend([
                     "MISE_CACHE_SOCKET".into(),
+                    "MISE_CACHE_STAGING_DIR".into(),
                     "MISE_CACHE_PREVIOUS_RUSTC_WRAPPER".into(),
                     "RUSTC_WRAPPER".into(),
                     "CARGO_INCREMENTAL".into(),
@@ -986,6 +987,14 @@ impl TaskExecutor {
                 }
                 to_run.push(t);
             }
+        }
+        for task in &mut to_run {
+            self.context_builder
+                .render_task_file_templates(config, task, &self.tool)
+                .await
+                .wrap_err_with(|| {
+                    format!("failed to render sources/outputs for task {}", task.name)
+                })?;
         }
         let sub_deps = Deps::new_pruned(config, to_run, completion_state).await?;
         let sub_deps = Arc::new(Mutex::new(sub_deps));
@@ -1777,7 +1786,8 @@ impl TaskExecutor {
                 && task
                     .run_script_strings()
                     .iter()
-                    .any(|script| contains_template_syntax(script)));
+                    .any(|script| contains_template_syntax(script)))
+            || task.has_usage_file_templates();
         if contains_template_syntax(&task.usage) {
             task.validate_template_syntax_for_preflight(&task.usage)
                 .wrap_err_with(|| format!("invalid usage template for task {}", task.name))?;
@@ -1793,6 +1803,12 @@ impl TaskExecutor {
                         format!("invalid task script template for task {}", task.name)
                     })?;
             }
+        }
+        for template in task.usage_file_templates() {
+            task.validate_template_syntax_for_preflight(&template)
+                .wrap_err_with(|| {
+                    format!("invalid source/output template for task {}", task.name)
+                })?;
         }
         if dynamic_usage {
             // The side-effect-free context intentionally omits task/subproject
