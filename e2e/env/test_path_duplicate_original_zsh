@@ -1,0 +1,51 @@
+#!/usr/bin/env zsh
+# shellcheck disable=SC1071
+set -euo pipefail
+
+# Regression test for https://github.com/jdx/mise/discussions/8028.
+# A path prepended after activation can duplicate an entry captured in
+# __MISE_ORIG_PATH. That duplicate must not move the neighboring prepends.
+
+MISE_BIN=$(whence -p mise)
+
+mkdir -p homebrew/bin homebrew/sbin custom-a custom-b managed
+cat >mise.toml <<EOF
+[env]
+_.path = ["$PWD/managed"]
+EOF
+
+MANAGED_PATH="$PWD/managed"
+BREW_BIN="$PWD/homebrew/bin"
+BREW_SBIN="$PWD/homebrew/sbin"
+CUSTOM_A="$PWD/custom-a"
+CUSTOM_B="$PWD/custom-b"
+
+export __MISE_ORIG_PATH="$BREW_BIN:$BREW_SBIN:/usr/bin:/bin"
+path=(
+  "$CUSTOM_B"
+  "$BREW_SBIN"
+  "$CUSTOM_A"
+  "$BREW_BIN"
+  "$BREW_SBIN"
+  /usr/bin
+  /bin
+)
+
+eval "$("$MISE_BIN" hook-env -s zsh)"
+
+expected=(
+  "$CUSTOM_B"
+  "$CUSTOM_A"
+  "$MANAGED_PATH"
+  "$BREW_BIN"
+  "$BREW_SBIN"
+  /usr/bin
+  /bin
+)
+
+if [[ ${(j/:/)path} != "${(j/:/)expected}" ]]; then
+  print -u2 "unexpected PATH order"
+  print -u2 "expected: ${(j/:/)expected}"
+  print -u2 "actual:   ${(j/:/)path}"
+  exit 1
+fi
