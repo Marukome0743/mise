@@ -199,6 +199,160 @@ fn insert_core_options(table: &mut InlineTable, options: ToolVersionOptions) {
     }
 }
 
+const TOOL_SELECTOR_KEYS: [&str; 4] = ["version", "prefix", "ref", "path"];
+
+fn tool_request_selector(request: &ToolRequest) -> (&'static str, String) {
+    match request {
+        ToolRequest::Version { version, .. } => ("version", version.clone()),
+        ToolRequest::Prefix { prefix, .. } => ("prefix", prefix.clone()),
+        ToolRequest::Ref { ref_, ref_type, .. } if ref_type == "ref" => ("ref", ref_.clone()),
+        ToolRequest::Path { .. } => (
+            "path",
+            request.version().strip_prefix("path:").unwrap().to_string(),
+        ),
+        // `tag:`, `branch:`, `rev:`, `sub-N:` and `system` have no dedicated
+        // key in table syntax, so preserve their complete request string in
+        // the general `version` selector.
+        _ => ("version", request.version()),
+    }
+}
+
+fn insert_table_item_preserving_decor(table: &mut toml_edit::Table, key: &str, mut item: Item) {
+    let key = get_key_with_decor(table, key);
+    let value_decor = get_value_decor(table, key.get());
+    set_value_decor(&mut item, &value_decor);
+    table.insert_formatted(&key, item);
+}
+
+fn insert_inline_value_preserving_decor(table: &mut InlineTable, key: &str, mut value: Value) {
+    let key = table
+        .get_key_value(key)
+        .map(|(key, _)| key.clone())
+        .unwrap_or_else(|| Key::from(key));
+    if let Some(existing) = table.get(key.get()) {
+        *value.decor_mut() = existing.decor().clone();
+    }
+    table.insert_formatted(&key, value);
+}
+
+fn update_install_env_table(table: &mut toml_edit::Table, options: &ToolVersionOptions) {
+    if options.install_env.is_empty() {
+        return;
+    }
+
+    match table.get_mut("install_env") {
+        Some(Item::Table(env)) => {
+            for (key, env_value) in &options.install_env {
+                insert_table_item_preserving_decor(env, key, value(env_value.clone()));
+            }
+        }
+        Some(Item::Value(Value::InlineTable(env))) => {
+            for (key, env_value) in &options.install_env {
+                insert_inline_value_preserving_decor(env, key, env_value.clone().into());
+            }
+        }
+        _ => {
+            let mut env = InlineTable::new();
+            for (key, env_value) in &options.install_env {
+                env.insert(key, env_value.clone().into());
+            }
+            insert_table_item_preserving_decor(
+                table,
+                "install_env",
+                Item::Value(Value::InlineTable(env)),
+            );
+        }
+    }
+}
+
+fn update_explicit_tool_options(table: &mut toml_edit::Table, options: &ToolVersionOptions) {
+    for (key, value) in &options.opts {
+        insert_table_item_preserving_decor(
+            table,
+            key,
+            Item::Value(toml_value_to_edit(value.clone())),
+        );
+    }
+    if let Some(os) = &options.os {
+        let mut arr = Array::new();
+        for os in os {
+            arr.push(os.as_str());
+        }
+        insert_table_item_preserving_decor(table, "os", Item::Value(Value::Array(arr)));
+    }
+    if let Some(depends) = &options.depends {
+        let mut arr = Array::new();
+        for dependency in depends {
+            arr.push(dependency.as_str());
+        }
+        insert_table_item_preserving_decor(table, "depends", Item::Value(Value::Array(arr)));
+    }
+    update_install_env_table(table, options);
+}
+
+fn update_standard_tool_table(
+    table: &mut toml_edit::Table,
+    request: &ToolRequest,
+    explicit_options: Option<&ToolVersionOptions>,
+) {
+    let (selector, selector_value) = tool_request_selector(request);
+    let existing_selector = TOOL_SELECTOR_KEYS
+        .iter()
+        .find(|key| table.contains_key(key))
+        .copied();
+    let selector_key = existing_selector
+        .map(|existing| get_key_with_decor_from(table, selector, existing))
+        .unwrap_or_else(|| Key::from(selector));
+    let selector_decor = existing_selector.and_then(|key| get_value_decor(table, key));
+    let mut selector_item = value(selector_value);
+    set_value_decor(&mut selector_item, &selector_decor);
+
+    if let Some(existing) = existing_selector {
+        let names = table.iter().map(|(key, _)| key.to_string()).collect_vec();
+        let entries = names
+            .into_iter()
+            .filter_map(|key| table.remove_entry(&key).map(|entry| (key, entry)))
+            .collect_vec();
+        for (key, (formatted_key, item)) in entries {
+            if key == existing {
+                table.insert_formatted(&selector_key, selector_item.clone());
+            } else if !TOOL_SELECTOR_KEYS.contains(&key.as_str()) {
+                table.insert_formatted(&formatted_key, item);
+            }
+        }
+    } else {
+        table.insert_formatted(&selector_key, selector_item);
+    }
+
+    if let Some(options) = explicit_options {
+        update_explicit_tool_options(table, options);
+    }
+}
+
+fn replace_tool_entries_preserving_position(
+    tools: &mut toml_edit::Table,
+    keys: &[String],
+    key: Key,
+    item: Item,
+) {
+    let Some(first) = keys.first() else {
+        tools.insert_formatted(&key, item);
+        return;
+    };
+    let names = tools.iter().map(|(key, _)| key.to_string()).collect_vec();
+    let entries = names
+        .into_iter()
+        .filter_map(|name| tools.remove_entry(&name).map(|entry| (name, entry)))
+        .collect_vec();
+    for (name, (formatted_key, existing_item)) in entries {
+        if &name == first {
+            tools.insert_formatted(&key, item.clone());
+        } else if !keys.contains(&name) {
+            tools.insert_formatted(&formatted_key, existing_item);
+        }
+    }
+}
+
 #[derive(Default, Deserialize)]
 pub struct MiseToml {
     #[serde(rename = "_")]
@@ -1155,6 +1309,17 @@ impl ConfigFile for MiseToml {
             .and_then(|i| i.as_value())
             .and_then(|v| v.as_array())
             .cloned();
+
+        if versions.len() == 1
+            && let Some(mut table) = tools.get(&existing).and_then(Item::as_table).cloned()
+        {
+            update_standard_tool_table(&mut table, &versions[0], ba.explicit_opts());
+            replace_tool_entries_preserving_position(tools, &keys, key, Item::Table(table));
+            if is_tools_sorted {
+                tools.sort_values();
+            }
+            return Ok(());
+        }
 
         // drop the other spellings: they all deserialize to this one entry, so leaving one behind
         // means the file has two keys for one tool and the later one silently wins on read-back.
@@ -3821,6 +3986,163 @@ run = 'echo "template"'
         assert_snapshot!(cf);
         assert_debug_snapshot!(cf);
         file::remove_all(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_preserves_standard_tool_table() {
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".standard-tool-table.mise.toml");
+        let input = indoc! {r#"
+            # tool header comment
+            [tools.dummy]
+            # version explanation
+            version = "1.0.0" # selector comment
+            foo = "bar" # option comment
+
+            [tools.dummy.install_env]
+            # nested explanation
+            FOO = "bar" # nested comment
+        "#};
+        file::write(&p, input).unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let dummy = BackendArg::from("dummy");
+        let options = cf.tools.lock().unwrap().get(&dummy).unwrap().0[0]
+            .options
+            .clone()
+            .unwrap();
+
+        cf.replace_versions(
+            &dummy,
+            vec![
+                ToolRequest::new_opts(
+                    Arc::new(dummy.clone()),
+                    "2.0.0",
+                    options,
+                    ToolSource::Unknown,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            cf.dump().unwrap(),
+            input.replace("version = \"1.0.0\"", "version = \"2.0.0\"")
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_changes_standard_table_selector_in_place() {
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".standard-selector.mise.toml");
+        file::write(
+            &p,
+            indoc! {r#"
+                [tools.dummy]
+                version = "1.0.0" # keep selector comment
+                foo = "bar"
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let dummy = BackendArg::from("dummy");
+        let options = cf.tools.lock().unwrap().get(&dummy).unwrap().0[0]
+            .options
+            .clone()
+            .unwrap();
+
+        cf.replace_versions(
+            &dummy,
+            vec![
+                ToolRequest::new_opts(
+                    Arc::new(dummy.clone()),
+                    "prefix:2",
+                    options,
+                    ToolSource::Unknown,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            cf.dump().unwrap(),
+            indoc! {r#"
+                [tools.dummy]
+                prefix = "2" # keep selector comment
+                foo = "bar"
+            "#}
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_preserves_standard_table_when_renaming_alias() {
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".standard-alias.mise.toml");
+        file::write(
+            &p,
+            indoc! {r#"
+                # node table comment
+                [tools.nodejs]
+                version = "20.0.0" # keep me
+
+                [tools.dummy]
+                version = "1.0.0"
+            "#},
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let node = BackendArg::from("node");
+
+        cf.replace_versions(
+            &node,
+            vec![ToolRequest::new(Arc::new(node.clone()), "22.0.0", ToolSource::Unknown).unwrap()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            cf.dump().unwrap(),
+            indoc! {r#"
+                # node table comment
+                [tools.node]
+                version = "22.0.0" # keep me
+
+                [tools.dummy]
+                version = "1.0.0"
+            "#}
+        );
+        file::remove_file(&p).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replace_versions_converts_standard_table_for_multiple_versions() {
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".standard-to-array.mise.toml");
+        file::write(&p, "[tools.dummy]\nversion = \"1.0.0\"\n").unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        let dummy = BackendArg::from("dummy");
+
+        cf.replace_versions(
+            &dummy,
+            vec![
+                ToolRequest::new(Arc::new(dummy.clone()), "1.0.0", ToolSource::Unknown).unwrap(),
+                ToolRequest::new(Arc::new(dummy.clone()), "2.0.0", ToolSource::Unknown).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let dump = cf.dump().unwrap();
+        assert!(
+            dump.contains("[\"1.0.0\", \"2.0.0\"]"),
+            "both versions should be preserved: {dump}"
+        );
+        assert!(
+            !dump.contains("[tools.dummy]"),
+            "multiple versions should use array syntax: {dump}"
+        );
+        file::remove_file(&p).unwrap();
     }
 
     #[tokio::test]
