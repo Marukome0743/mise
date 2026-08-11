@@ -391,20 +391,23 @@ pub fn create_provider(
     project_root: &Path,
     config: Option<&crate::config::Config>,
 ) -> Result<Box<dyn DepsProvider>> {
-    let (provider_root, provider_config) = config
-        .and_then(|c| {
-            c.config_files.values().find_map(|cf| {
-                cf.deps_config()
-                    .and_then(|dc| dc.providers.get(ecosystem).cloned())
-                    .map(|provider_config| (cf.config_root(), provider_config))
-            })
-        })
-        .unwrap_or_else(|| {
-            (
-                project_root.to_path_buf(),
-                rule::DepsProviderConfig::default(),
-            )
-        });
+    let mut configured = None;
+    if let Some(config) = config {
+        for cf in config.config_files.values() {
+            if let Some(deps_config) = cf.deps_config()?
+                && let Some(provider_config) = deps_config.providers.get(ecosystem)
+            {
+                configured = Some((cf.config_root(), provider_config.clone()));
+                break;
+            }
+        }
+    }
+    let (provider_root, provider_config) = configured.unwrap_or_else(|| {
+        (
+            project_root.to_path_buf(),
+            rule::DepsProviderConfig::default(),
+        )
+    });
 
     DepsEngine::build_provider(ecosystem, &provider_root, provider_config)
         .ok_or_else(|| eyre::eyre!("unknown deps provider '{ecosystem}'"))

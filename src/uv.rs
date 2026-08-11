@@ -117,7 +117,7 @@ fn deps_uv_enabled(config: &Config, uv_root: &Path) -> bool {
             return false;
         }
         cf.deps_config()
-            .is_some_and(|deps| deps.providers.contains_key("uv"))
+            .is_ok_and(|deps| deps.is_some_and(|deps| deps.providers.contains_key("uv")))
     })
 }
 
