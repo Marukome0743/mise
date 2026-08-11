@@ -22,7 +22,7 @@ use crate::toolset::ToolRequest;
 use crate::toolset::ToolVersion;
 use crate::toolset::ToolVersionOptions;
 use crate::ui::progress_report::SingleReport;
-use crate::{dirs, file, hash};
+use crate::{dirs, env, file, hash};
 use async_trait::async_trait;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
@@ -240,24 +240,40 @@ impl HttpBackend {
     // Cache path helpers
     // -------------------------------------------------------------------------
 
-    /// Get the http-tarballs directory in DATA (survives `mise cache clear`)
-    fn tarballs_dir() -> PathBuf {
+    /// Get the http-tarballs directory for this installation.
+    ///
+    /// Normal installs share the existing data-dir cache. Explicit shared and
+    /// system installs keep their cache beneath the destination tool directory
+    /// so the installation does not depend on the installing user's home.
+    fn tarballs_dir(tv: &ToolVersion) -> PathBuf {
+        // install-into supplies an arbitrary final path, not a destination tool
+        // directory. Preserve its existing use of the normal data-dir cache.
+        if tv.install_path_is_exact {
+            return dirs::DATA.join(HTTP_TARBALLS_DIR);
+        }
+        if let Some(install_path) = &tv.install_path
+            && !install_path.starts_with(&tv.ba().installs_path)
+            && let Some(tool_dir) = install_path.parent()
+        {
+            return tool_dir.join(format!(".{HTTP_TARBALLS_DIR}"));
+        }
         dirs::DATA.join(HTTP_TARBALLS_DIR)
     }
 
     /// Get the path to a specific cache entry
-    fn cache_path(&self, cache_key: &str) -> PathBuf {
-        Self::tarballs_dir().join(cache_key)
+    fn cache_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
+        cache_dir.join(cache_key)
     }
 
     /// Get the path to the metadata file for a cache entry
-    fn metadata_path(&self, cache_key: &str) -> PathBuf {
-        self.cache_path(cache_key).join(METADATA_FILE)
+    fn metadata_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
+        Self::cache_path(cache_dir, cache_key).join(METADATA_FILE)
     }
 
     /// Check if a cache entry exists and is valid
-    fn is_cached(&self, cache_key: &str) -> bool {
-        self.cache_path(cache_key).exists() && self.metadata_path(cache_key).exists()
+    fn is_cached(cache_dir: &Path, cache_key: &str) -> bool {
+        Self::cache_path(cache_dir, cache_key).exists()
+            && Self::metadata_path(cache_dir, cache_key).exists()
     }
 
     // -------------------------------------------------------------------------
@@ -388,14 +404,19 @@ impl HttpBackend {
     /// Detect extraction type from an existing cache directory
     /// This handles the case where a cache hit occurs but the original extraction
     /// used different options (e.g., different `bin` name)
-    fn extraction_type_from_cache(&self, cache_key: &str, file_info: &FileInfo) -> ExtractionType {
+    fn extraction_type_from_cache(
+        &self,
+        cache_dir: &Path,
+        cache_key: &str,
+        file_info: &FileInfo,
+    ) -> ExtractionType {
         // For archives, we don't need to detect the filename
         if !file_info.is_compressed_binary && file_info.format != file::ExtractionFormat::Raw {
             return ExtractionType::Archive;
         }
 
         // For raw files, find the actual filename in the cache directory
-        let cache_path = self.cache_path(cache_key);
+        let cache_path = Self::cache_path(cache_dir, cache_key);
         for entry in xx::file::ls(&cache_path).unwrap_or_default() {
             if let Some(name) = entry.file_name().map(|n| n.to_string_lossy().to_string()) {
                 // Skip metadata file
@@ -425,13 +446,14 @@ impl HttpBackend {
         opts: &HttpOptions<'_>,
         pr: Option<&dyn SingleReport>,
     ) -> Result<ExtractionType> {
-        let cache_path = self.cache_path(&cache_plan.key);
+        let cache_dir = Self::tarballs_dir(tv);
+        let cache_path = Self::cache_path(&cache_dir, &cache_plan.key);
 
         // Ensure parent directory exists
-        file::create_dir_all(Self::tarballs_dir())?;
+        file::create_dir_all(&cache_dir)?;
 
         // Create unique temp directory for atomic extraction
-        let tmp_path = Self::tarballs_dir().join(format!(
+        let tmp_path = cache_dir.join(format!(
             "{}.tmp-{}-{}",
             cache_plan.key,
             std::process::id(),
@@ -454,7 +476,7 @@ impl HttpBackend {
         std::fs::rename(&tmp_path, &cache_path)?;
 
         // Write metadata
-        self.write_metadata(&cache_plan.key, url, file_path, opts)?;
+        self.write_metadata(&cache_dir, &cache_plan.key, url, file_path, opts)?;
 
         Ok(extraction_type)
     }
@@ -570,6 +592,7 @@ impl HttpBackend {
     /// Write cache metadata file
     fn write_metadata(
         &self,
+        cache_dir: &Path,
         cache_key: &str,
         url: &str,
         file_path: &Path,
@@ -584,7 +607,7 @@ impl HttpBackend {
         };
 
         let json = serde_json::to_string_pretty(&metadata)?;
-        file::write(self.metadata_path(cache_key), json)?;
+        file::write(Self::metadata_path(cache_dir, cache_key), json)?;
         Ok(())
     }
 
@@ -605,9 +628,17 @@ impl HttpBackend {
 
     /// Return the absolute path where the HTTP install symlink should live.
     fn install_path_for(tv: &ToolVersion, cache_key: &str) -> PathBuf {
-        tv.ba()
-            .installs_path
-            .join(Self::install_version_name(tv, cache_key))
+        if tv.install_path_is_exact
+            && let Some(install_path) = &tv.install_path
+        {
+            return install_path.clone();
+        }
+        let tool_dir = tv
+            .install_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .unwrap_or(&tv.ba().installs_path);
+        tool_dir.join(Self::install_version_name(tv, cache_key))
     }
 
     /// Return the install path later lookups should check for this HTTP tool.
@@ -618,9 +649,12 @@ impl HttpBackend {
         if tv.version == "latest" {
             tv.install_path()
         } else {
-            tv.ba()
-                .installs_path
-                .join(Self::install_version_name(tv, ""))
+            let pathname = Self::install_version_name(tv, "");
+            env::find_in_shared_installs(
+                tv.ba().installs_path.join(&pathname),
+                &tv.ba().tool_dir_name(),
+                &pathname,
+            )
         }
     }
 
@@ -653,11 +687,12 @@ impl HttpBackend {
     fn create_install_symlink(
         &self,
         tv: &ToolVersion,
+        cache_dir: &Path,
         cache_key: &str,
         extraction_type: &ExtractionType,
         opts: &HttpOptions<'_>,
     ) -> Result<()> {
-        let cache_path = self.cache_path(cache_key);
+        let cache_path = Self::cache_path(cache_dir, cache_key);
 
         // Determine version name for install path
         let install_path = Self::install_path_for(tv, cache_key);
@@ -691,13 +726,18 @@ impl HttpBackend {
 
     /// Create additional symlink for latest versions
     fn create_version_alias_symlink(&self, tv: &ToolVersion, cache_key: &str) -> Result<()> {
-        if tv.version != "latest" {
+        if tv.version != "latest" || tv.install_path_is_exact {
             return Ok(());
         }
 
         let content_version = Self::content_version_name(cache_key);
-        let original_path = tv.ba().installs_path.join(&tv.version);
-        let content_path = tv.ba().installs_path.join(&content_version);
+        let content_path = Self::install_path_for(tv, cache_key);
+        let tool_dir = content_path
+            .parent()
+            .expect("HTTP install path must have a parent");
+        let original_path = tool_dir.join(&tv.version);
+        let expected_content_path = tool_dir.join(&content_version);
+        debug_assert_eq!(content_path, expected_content_path);
 
         if original_path.exists() {
             file::remove_all(&original_path)?;
@@ -1045,21 +1085,22 @@ impl Backend for HttpBackend {
 
         // Generate cache key
         let cache_plan = self.cache_plan(&file_path, &opts)?;
+        let cache_dir = Self::tarballs_dir(&tv);
 
         // Acquire lock and extract or reuse cache
-        let cache_path = self.cache_path(&cache_plan.key);
+        let cache_path = Self::cache_path(&cache_dir, &cache_plan.key);
         let _lock = crate::lock_file::get(&cache_path, ctx.force)?;
 
         // Determine extraction type based on whether we're using cache or extracting fresh
         // On cache hit, we need to detect the actual filename from the cache (which may differ
         // from current options if a previous extraction used different `bin` name)
         ctx.pr.next_operation();
-        let extraction_type = if self.is_cached(&cache_plan.key) {
+        let extraction_type = if Self::is_cached(&cache_dir, &cache_plan.key) {
             ctx.pr.set_message("using cached tarball".into());
             // Report extraction operation as complete (instant since we're using cache)
             ctx.pr.set_length(1);
             ctx.pr.set_position(1);
-            self.extraction_type_from_cache(&cache_plan.key, &cache_plan.file_info)
+            self.extraction_type_from_cache(&cache_dir, &cache_plan.key, &cache_plan.file_info)
         } else {
             ctx.pr.set_message("extracting to cache".into());
             self.extract_to_cache(
@@ -1073,7 +1114,7 @@ impl Backend for HttpBackend {
         };
 
         // Create symlinks
-        self.create_install_symlink(&tv, &cache_plan.key, &extraction_type, &opts)?;
+        self.create_install_symlink(&tv, &cache_dir, &cache_plan.key, &extraction_type, &opts)?;
         self.create_version_alias_symlink(&tv, &cache_plan.key)?;
         tv.install_path = Some(Self::install_path_for(&tv, &cache_plan.key));
 
@@ -1175,13 +1216,21 @@ mod tests {
     use crate::toolset::{ToolRequest, ToolSource};
 
     fn http_test_tv(version: &str) -> ToolVersion {
-        let backend = Arc::new(BackendArg::new_raw(
+        http_test_tv_with_installs(version, None)
+    }
+
+    fn http_test_tv_with_installs(version: &str, installs_path: Option<PathBuf>) -> ToolVersion {
+        let mut backend = BackendArg::new_raw(
             "http-absolute-version".to_string(),
             Some("http:absolute-version".to_string()),
             "absolute-version".to_string(),
             None,
             BackendResolution::new(true),
-        ));
+        );
+        if let Some(installs_path) = installs_path {
+            backend.installs_path = installs_path;
+        }
+        let backend = Arc::new(backend);
         let request = ToolRequest::Version {
             backend,
             version: version.to_string(),
@@ -1320,6 +1369,74 @@ mod tests {
         let lookup_path = HttpBackend::lookup_install_path(&tv);
 
         assert_eq!(lookup_path, install_path);
+    }
+
+    #[test]
+    fn explicit_install_path_uses_destination_tool_dir_and_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_tool_dir = temp.path().join("user/installs/http-absolute-version");
+        let destination_tool_dir = temp.path().join("shared/http-absolute-version");
+        let mut tv = http_test_tv_with_installs("1.0.0", Some(primary_tool_dir));
+        tv.install_path = Some(destination_tool_dir.join("1.0.0"));
+
+        assert_eq!(
+            HttpBackend::install_path_for(&tv, "abcdef123456"),
+            destination_tool_dir.join("1.0.0")
+        );
+        assert_eq!(
+            HttpBackend::tarballs_dir(&tv),
+            destination_tool_dir.join(".http-tarballs")
+        );
+    }
+
+    #[test]
+    fn explicit_latest_install_stays_in_destination_tool_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_tool_dir = temp.path().join("user/installs/http-absolute-version");
+        let destination_tool_dir = temp.path().join("system/http-absolute-version");
+        let mut tv = http_test_tv_with_installs("latest", Some(primary_tool_dir));
+        tv.install_path = Some(destination_tool_dir.join("latest"));
+
+        assert_eq!(
+            HttpBackend::install_path_for(&tv, "abcdef123456"),
+            destination_tool_dir.join("abcdef1")
+        );
+        assert_eq!(
+            HttpBackend::tarballs_dir(&tv),
+            destination_tool_dir.join(".http-tarballs")
+        );
+    }
+
+    #[test]
+    fn primary_install_keeps_shared_data_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_tool_dir = temp.path().join("user/installs/http-absolute-version");
+        let mut tv = http_test_tv_with_installs("1.0.0", Some(primary_tool_dir.clone()));
+        tv.install_path = Some(primary_tool_dir.join("1.0.0"));
+
+        assert_eq!(
+            HttpBackend::tarballs_dir(&tv),
+            dirs::DATA.join(HTTP_TARBALLS_DIR)
+        );
+    }
+
+    #[test]
+    fn exact_install_path_is_not_rewritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_tool_dir = temp.path().join("user/installs/http-absolute-version");
+        let destination = temp.path().join("install-into/destination");
+        let mut tv = http_test_tv_with_installs("1.0.0", Some(primary_tool_dir));
+        tv.install_path = Some(destination.clone());
+        tv.install_path_is_exact = true;
+
+        assert_eq!(
+            HttpBackend::install_path_for(&tv, "abcdef123456"),
+            destination
+        );
+        assert_eq!(
+            HttpBackend::tarballs_dir(&tv),
+            dirs::DATA.join(HTTP_TARBALLS_DIR)
+        );
     }
 
     #[test]
