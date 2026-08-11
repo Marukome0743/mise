@@ -1,11 +1,12 @@
+use crate::config::Settings;
 use crate::task::Task;
 #[cfg(test)]
 use crate::task::TaskRustCacheConfig;
 use bytesize::ByteSize;
 use eyre::{Context, Result, bail};
 use mise_cache_core::{
-    AGENT_PROTOCOL_VERSION, AgentRequest, AgentResponse, AgentStats, CacheAgent, CacheDigest,
-    canonical_json,
+    AGENT_PROTOCOL_VERSION, AgentRemoteCache, AgentRequest, AgentResponse, AgentStats, CacheAgent,
+    CacheDigest, RemoteCacheClient, RemoteCacheConfig, canonical_json,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -22,6 +23,7 @@ const RUSTC_SHIM_STEM: &str = "mise-cache-rustc";
 const SOCKET_ENV: &str = "MISE_CACHE_SOCKET";
 pub(super) const STAGING_ENV: &str = "MISE_CACHE_STAGING_DIR";
 pub(super) const TASK_ENV: &str = "MISE_CACHE_TASK";
+pub(super) const VERIFY_ENV: &str = "MISE_CACHE_RUST_VERIFY";
 const PREVIOUS_RUSTC_WRAPPER_ENV: &str = "MISE_CACHE_PREVIOUS_RUSTC_WRAPPER";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -34,7 +36,7 @@ pub(crate) struct CacheSessionEnvironment {
 }
 
 impl CacheSessionEnvironment {
-    pub(crate) fn apply(
+    pub(crate) async fn apply(
         &self,
         task: &Task,
         environment: &mut BTreeMap<String, String>,
@@ -43,7 +45,7 @@ impl CacheSessionEnvironment {
             return None;
         }
         let task_identity = task_action_identity(task);
-        let (protocol_task, action_run) = match self.agent.begin_task(&task_identity) {
+        let (protocol_task, action_run) = match self.agent.begin_task(&task_identity).await {
             Ok(run) => (
                 run.clone(),
                 Some(TaskActionRun {
@@ -59,6 +61,11 @@ impl CacheSessionEnvironment {
         environment.insert(SOCKET_ENV.into(), self.socket.clone());
         environment.insert(STAGING_ENV.into(), self.staging.clone());
         environment.insert(TASK_ENV.into(), protocol_task);
+        if task.rust_cache.as_ref().is_some_and(|cache| cache.verify) {
+            environment.insert(VERIFY_ENV.into(), "1".into());
+        } else {
+            environment.remove(VERIFY_ENV);
+        }
         if let Some(previous) = environment.insert("RUSTC_WRAPPER".into(), self.rustc_shim.clone())
             && previous != self.rustc_shim
         {
@@ -83,8 +90,8 @@ pub(crate) struct TaskActionRun {
 }
 
 impl TaskActionRun {
-    pub(crate) fn commit(self) -> Result<()> {
-        self.agent.commit_task(&self.run)
+    pub(crate) async fn commit(self) -> Result<()> {
+        self.agent.commit_task(&self.run).await
     }
 }
 
@@ -136,7 +143,11 @@ impl CacheSession {
         let shim = install_session_shim(session_dir)?;
         let staging = session_dir.join("staging");
         std::fs::create_dir(&staging)?;
-        let agent = CacheAgent::new(cache_dir, VERSION);
+        let agent = if let Some(remote) = action_remote_cache(&cache_dir)? {
+            CacheAgent::new_remote(cache_dir, VERSION, remote)
+        } else {
+            CacheAgent::new(cache_dir, VERSION)
+        };
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (socket, server) = spawn_server(session_dir, agent.clone(), shutdown_rx).await?;
         Ok(Self {
@@ -164,8 +175,47 @@ impl CacheSession {
         if let Some(server) = server {
             server.await??;
         }
+        self.agent.cancel_prefetches().await;
         Ok(self.agent.stats())
     }
+}
+
+fn action_remote_cache(cache_dir: &Path) -> Result<Option<AgentRemoteCache>> {
+    let settings = Settings::get();
+    let Some(base_url) = settings.task.cache.remote_url.clone() else {
+        return Ok(None);
+    };
+    let namespace = settings
+        .task
+        .cache
+        .remote_namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|namespace| !namespace.is_empty())
+        .ok_or_else(|| {
+            eyre::eyre!("task.cache.remote_namespace is required when task.cache.remote_url is set")
+        })?
+        .to_string();
+    let client = RemoteCacheClient::new(RemoteCacheConfig {
+        base_url: base_url.parse().wrap_err("invalid task.cache.remote_url")?,
+        namespace,
+        token: settings.task.cache.remote_token.clone(),
+        token_file: settings.task.cache.remote_token_file.clone(),
+        oidc_audience: settings.task.cache.remote_oidc_audience.clone(),
+        connect_timeout: settings.http_timeout(),
+        read_timeout: settings.http_timeout(),
+        download_timeout: settings.http_download_timeout(),
+        retries: settings.http_retries(),
+    })?;
+    let Some(mode) = crate::cache::effective_remote_cache_mode(settings.task.cache.remote_mode)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(AgentRemoteCache {
+        client,
+        mode,
+        staging_dir: cache_dir.join("remote"),
+    }))
 }
 
 impl Drop for CacheSession {
@@ -180,16 +230,37 @@ impl Drop for CacheSession {
 }
 
 pub(crate) fn display_stats(stats: AgentStats) {
-    if stats.lookups == 0 && stats.stores == 0 {
+    if stats.lookups == 0
+        && stats.stores == 0
+        && stats.verifications == 0
+        && stats.downloaded_bytes == 0
+        && stats.uploaded_bytes == 0
+    {
         return;
     }
     safe_eprintln!(
-        "Action cache: {}/{} hits, {} stored ({})",
+        "Action cache: {} hits, {} misses, {} prefetched; {} downloaded, {} uploaded, {} stored locally",
         stats.hits,
-        stats.lookups,
-        stats.stores,
+        cache_misses(&stats),
+        stats.prefetched_actions,
+        ByteSize::b(stats.downloaded_bytes).display().iec(),
+        ByteSize::b(stats.uploaded_bytes).display().iec(),
         ByteSize::b(stats.stored_bytes).display().iec(),
     );
+    if stats.verifications > 0 {
+        safe_eprintln!(
+            "Action cache qualification: {} verified, {} diverged",
+            stats.verifications,
+            stats.divergences,
+        );
+    }
+}
+
+fn cache_misses(stats: &AgentStats) -> u64 {
+    stats
+        .lookups
+        .saturating_sub(stats.hits)
+        .saturating_sub(stats.verifications)
 }
 
 fn install_session_shim(session_dir: &Path) -> Result<PathBuf> {
@@ -643,8 +714,8 @@ fn validate_handshake_response(response: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn session_environment_is_scoped_to_selected_adapters() {
+    #[tokio::test]
+    async fn session_environment_is_scoped_to_selected_adapters() {
         let cache = tempfile::tempdir().unwrap();
         let environment = CacheSessionEnvironment {
             socket: "socket".into(),
@@ -654,17 +725,23 @@ mod tests {
         };
         let mut task = Task::default();
         let mut values = BTreeMap::from([("RUSTC_WRAPPER".into(), "existing".into())]);
-        let run = environment.apply(&task, &mut values);
+        let run = environment.apply(&task, &mut values).await;
         assert!(run.is_none());
         assert_eq!(values.get("RUSTC_WRAPPER").unwrap(), "existing");
 
-        task.rust_cache = Some(TaskRustCacheConfig { enabled: false });
-        let run = environment.apply(&task, &mut values);
+        task.rust_cache = Some(TaskRustCacheConfig {
+            enabled: false,
+            ..TaskRustCacheConfig::default()
+        });
+        let run = environment.apply(&task, &mut values).await;
         assert!(run.is_none());
         assert_eq!(values.get("RUSTC_WRAPPER").unwrap(), "existing");
 
-        task.rust_cache = Some(TaskRustCacheConfig { enabled: true });
-        let run = environment.apply(&task, &mut values);
+        task.rust_cache = Some(TaskRustCacheConfig {
+            verify: true,
+            ..TaskRustCacheConfig::default()
+        });
+        let run = environment.apply(&task, &mut values).await;
         assert!(run.is_some());
         assert_eq!(values.get(SOCKET_ENV).unwrap(), "socket");
         assert_eq!(values.get(STAGING_ENV).unwrap(), "staging");
@@ -672,6 +749,7 @@ mod tests {
         assert_eq!(values.get("RUSTC_WRAPPER").unwrap(), "shim");
         assert_eq!(values.get(PREVIOUS_RUSTC_WRAPPER_ENV).unwrap(), "existing");
         assert_eq!(values.get("CARGO_INCREMENTAL").unwrap(), "0");
+        assert_eq!(values.get(VERIFY_ENV).unwrap(), "1");
     }
 
     #[test]
@@ -682,5 +760,16 @@ mod tests {
         })
         .unwrap();
         assert!(validate_handshake_response(&response).is_err());
+    }
+
+    #[test]
+    fn qualification_results_are_not_reported_as_misses() {
+        let stats = AgentStats {
+            lookups: 5,
+            hits: 2,
+            verifications: 2,
+            ..AgentStats::default()
+        };
+        assert_eq!(cache_misses(&stats), 1);
     }
 }
