@@ -24,7 +24,7 @@ use crate::config::config_file::{
 };
 use crate::config::config_file::{config_root, toml::deserialize_arr};
 use crate::config::env_directive::{
-    AgeFormat, EnvDirective, EnvDirectiveOptions, EnvValue, RequiredValue,
+    AgeFormat, EnvDirective, EnvDirectiveOptions, EnvValue, RequiredValue, shell_expand_env,
 };
 use crate::config::settings::SettingsPartial;
 use crate::config::{Alias, AliasMap, Config, Settings};
@@ -1480,8 +1480,41 @@ impl ConfigFile for MiseToml {
             .collect())
     }
 
-    fn deps_config(&self) -> Option<DepsConfig> {
-        self.deps.clone()
+    fn deps_config(&self) -> eyre::Result<Option<DepsConfig>> {
+        let Some(mut deps) = self.deps.clone() else {
+            return Ok(None);
+        };
+        let context = self.template_context();
+        let env_vars: BTreeMap<String, String> = context
+            .get("env")
+            .and_then(|value| Deserialize::deserialize(value.clone()).ok())
+            .unwrap_or_default();
+
+        for (provider_id, provider) in &mut deps.providers {
+            provider.render_strings(|field, input, shell_expand| {
+                let mut output = self
+                    .parse_template_with_context(&context, input)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to render deps provider {provider_id:?} field {field:?} in {}",
+                            display_path(&self.path)
+                        )
+                    })?;
+                if shell_expand && output.contains('$') && Settings::get().env_shell_expand {
+                    let mut missing_vars = Vec::new();
+                    output = shell_expand_env(&output, &env_vars, &mut missing_vars);
+                    for var in missing_vars {
+                        warn_once!(
+                            "env var '{var}' is not defined and will be left unexpanded. \
+                             Use ${{{var}:-}} to default to an empty string and suppress \
+                             this warning."
+                        );
+                    }
+                }
+                Ok(output)
+            })?;
+        }
+        Ok(Some(deps))
     }
 
     fn oci_config(&self) -> Option<OciConfig> {
@@ -3977,6 +4010,63 @@ run = 'echo "template"'
         foo5=5
         foo6=6
         "#);
+    }
+
+    #[test]
+    fn test_deps_config_renders_templates_and_shell_env() {
+        let config = parse(
+            indoc! {r#"
+            [env]
+            DEPS_SUFFIX = "expanded"
+
+            [deps.setup]
+            run = "echo {{ config_root }} $DEPS_SUFFIX"
+            sources = ["{{ config_root }}/input-$DEPS_SUFFIX"]
+            outputs = ["$DEPS_SUFFIX/output"]
+            env = { ROOT = "{{ config_root }}", SUFFIX = "$DEPS_SUFFIX" }
+            dir = "{{ config_root }}/$DEPS_SUFFIX"
+            description = "setup-$DEPS_SUFFIX"
+            depends = ["dependency-$DEPS_SUFFIX"]
+            timeout = "{{ 2 + 3 }}s"
+        "#}
+            .to_string(),
+        );
+
+        let deps = config.deps_config().unwrap().unwrap();
+        let provider = &deps.providers["setup"];
+        let config_root = CWD.as_ref().unwrap().to_string_lossy();
+        assert_eq!(
+            provider.run.as_deref(),
+            Some(format!("echo {config_root} $DEPS_SUFFIX").as_str())
+        );
+        assert_eq!(provider.sources, [format!("{config_root}/input-expanded")]);
+        assert_eq!(provider.outputs, ["expanded/output"]);
+        assert_eq!(provider.env["ROOT"], config_root);
+        assert_eq!(provider.env["SUFFIX"], "expanded");
+        assert_eq!(
+            provider.dir.as_deref(),
+            Some(format!("{config_root}/expanded").as_str())
+        );
+        assert_eq!(provider.description.as_deref(), Some("setup-expanded"));
+        assert_eq!(provider.depends, ["dependency-expanded"]);
+        assert_eq!(provider.timeout.as_deref(), Some("5s"));
+    }
+
+    #[test]
+    fn test_deps_config_reports_template_errors_with_field_context() {
+        let config = parse(
+            indoc! {r#"
+            [deps.setup]
+            run = "echo ok"
+            sources = ["{{ missing }}"]
+        "#}
+            .to_string(),
+        );
+
+        let err = config.deps_config().unwrap_err().to_string();
+        assert!(err.contains("deps provider \"setup\""), "{err}");
+        assert!(err.contains("field \"sources[0]\""), "{err}");
+        assert!(err.contains(".test.mise.toml"), "{err}");
     }
 
     fn parse(s: String) -> MiseToml {

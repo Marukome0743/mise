@@ -10,7 +10,6 @@ use crate::cmd::CmdLineRunner;
 use crate::config::config_file::ConfigFile;
 use crate::config::{Config, Settings};
 use crate::task::monorepo_scope;
-use crate::tera::{BASE_CONTEXT, contains_template_syntax, get_tera, render_str};
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
 use crate::ui::style;
@@ -215,19 +214,25 @@ impl DepsEngine {
             .ok_or_else(|| eyre::eyre!("no config file in scope sets monorepo_root = true"))?;
         let mut scoped_providers: Vec<(Box<dyn DepsProvider>, String, String)> = vec![];
         let mut provider_indices: HashMap<String, usize> = HashMap::new();
-        let config_files: Vec<_> = config_files.into_iter().collect();
+        let config_files: Vec<_> = config_files
+            .into_iter()
+            .map(|cf| {
+                let deps_config = cf.deps_config()?;
+                Ok((cf, deps_config))
+            })
+            .collect::<Result<_>>()?;
         let mut disabled_by_root: HashMap<PathBuf, HashSet<String>> = HashMap::new();
 
         // Layered config files share one provider namespace at each config root.
         // Collect disables first so their behavior does not depend on file order.
-        for cf in &config_files {
+        for (cf, deps_config) in &config_files {
             let Some(config_project_root) = cf.project_root() else {
                 continue;
             };
             if !config_project_root.starts_with(&monorepo_root) {
                 continue;
             }
-            if let Some(deps_config) = cf.deps_config() {
+            if let Some(deps_config) = deps_config {
                 disabled_by_root
                     .entry(cf.config_root())
                     .or_default()
@@ -235,14 +240,14 @@ impl DepsEngine {
             }
         }
 
-        for cf in config_files {
+        for (cf, deps_config) in config_files {
             let Some(config_project_root) = cf.project_root() else {
                 continue;
             };
             if !config_project_root.starts_with(&monorepo_root) {
                 continue;
             }
-            let Some(deps_config) = cf.deps_config() else {
+            let Some(deps_config) = deps_config else {
                 continue;
             };
 
@@ -379,7 +384,7 @@ impl DepsEngine {
         // Only include config files that belong to the current project root
         // (skip config files outside the current project root, e.g. from parent directories).
         for cf in config.config_files.values() {
-            let Some(deps_config) = cf.deps_config() else {
+            let Some(deps_config) = cf.deps_config()? else {
                 continue;
             };
 
@@ -1108,33 +1113,11 @@ impl DepsEngine {
             runner = runner.env(k, v);
         }
 
-        // Apply command-specific environment (can override toolset env)
-        // Render tera templates in env values (e.g., "{{env.baz}}")
-        let has_template_env = cmd.env.values().any(|v| contains_template_syntax(v));
-        let mut tera_state = if has_template_env {
-            let mut tera_ctx = BASE_CONTEXT.clone();
-            // Merge toolset env (which includes [env] directives) into tera context
-            // so templates like "{{env.MY_VAR}}" can resolve config-defined vars
-            let mut env_map = crate::env::PRISTINE_ENV.clone();
-            env_map.extend(toolset_env.iter().map(|(k, v)| (k.clone(), v.clone())));
-            tera_ctx.insert("env", &env_map);
-            Some((get_tera(cmd.cwd.as_deref()), tera_ctx))
-        } else {
-            None
-        };
+        // Apply command-specific environment (can override toolset env).
+        // Config-file templates have already been rendered with that file's
+        // config_root and environment context during provider discovery.
         for (k, v) in &cmd.env {
-            let rendered = if contains_template_syntax(v) {
-                let (tera, tera_ctx) = tera_state
-                    .as_mut()
-                    .expect("tera state should exist for template env values");
-                render_str(tera, v, tera_ctx).unwrap_or_else(|e| {
-                    warn!("failed to render template for deps env {k}: {e}");
-                    v.clone()
-                })
-            } else {
-                v.clone()
-            };
-            runner = runner.env(k, &rendered);
+            runner = runner.env(k, v);
         }
 
         // Use raw output for better UX during dependency installation
