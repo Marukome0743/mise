@@ -34,11 +34,9 @@ pub struct DepsProviderConfig {
     /// Command to run when stale (required for custom, optional override for built-in)
     pub run: Option<String>,
     /// Files/patterns to check for changes (required for custom, auto-detected for built-in)
-    #[serde(default)]
-    pub sources: Vec<String>,
+    pub sources: Option<Vec<String>>,
     /// Files/directories that should be newer than sources (required for custom, auto-detected for built-in)
-    #[serde(default)]
-    pub outputs: Vec<String>,
+    pub outputs: Option<Vec<String>>,
     /// Environment variables to set
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -66,4 +64,20 @@ pub struct DepsConfig {
     /// All provider configurations (both built-in and custom)
     #[serde(flatten)]
     pub providers: BTreeMap<String, DepsProviderConfig>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_options_preserve_omitted_and_explicit_empty() {
+        let omitted: DepsConfig = toml::from_str("[npm]\n").unwrap();
+        assert_eq!(omitted.providers["npm"].sources, None);
+        assert_eq!(omitted.providers["npm"].outputs, None);
+
+        let empty: DepsConfig = toml::from_str("[npm]\nsources = []\noutputs = []\n").unwrap();
+        assert_eq!(empty.providers["npm"].sources, Some(vec![]));
+        assert_eq!(empty.providers["npm"].outputs, Some(vec![]));
+    }
 }
