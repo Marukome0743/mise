@@ -3235,6 +3235,7 @@ Defaults to MISE_AFFECTED_HEAD, CI metadata, or HEAD
         arg <CD>
     }
     flag "-f --force" help="Force the tasks to run even if outputs are up to date"
+    flag --if-present help="Ignore task names and patterns that do not match any tasks"
     flag "-j --jobs" help=#"""
 Number of tasks to run in parallel
 Values below 1 are treated as 1
@@ -4090,6 +4091,7 @@ Defaults to MISE_AFFECTED_HEAD, CI metadata, or HEAD
             arg <CD>
         }
         flag "-f --force" help="Force the tasks to run even if outputs are up to date"
+        flag --if-present help="Ignore task names and patterns that do not match any tasks"
         flag "-j --jobs" help=#"""
 Number of tasks to run in parallel
 Values below 1 are treated as 1
