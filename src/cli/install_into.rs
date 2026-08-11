@@ -59,6 +59,7 @@ impl InstallInto {
             before_date,
         };
         tv.install_path = Some(self.path.clone());
+        tv.install_path_is_exact = true;
         // install-into force-reinstalls, which uninstalls (rm -rf) whatever
         // already exists at the install path. Check immediately before the
         // install performs that deletion (rather than at the start of `run`) so

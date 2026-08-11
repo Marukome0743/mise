@@ -44,6 +44,9 @@ pub struct ToolVersion {
     resolved_from_lockfile: bool,
     pub lock_platforms: BTreeMap<String, PlatformInfo>,
     pub install_path: Option<PathBuf>,
+    /// Treat `install_path` as the final destination rather than a
+    /// `<tool>/<version>` path that a backend may rewrite. Used by install-into.
+    pub(crate) install_path_is_exact: bool,
     /// Conda packages resolved during installation: (platform, basename) -> CondaPackageInfo
     pub conda_packages: BTreeMap<(String, String), CondaPackageInfo>,
     /// pkgx packages resolved during installation: (platform, package@version) -> PkgxPackageInfo
@@ -78,6 +81,7 @@ impl ToolVersion {
             resolved_from_lockfile: false,
             lock_platforms: Default::default(),
             install_path: None,
+            install_path_is_exact: false,
             conda_packages: Default::default(),
             pkgx_packages: Default::default(),
             install_satisfied: None,
