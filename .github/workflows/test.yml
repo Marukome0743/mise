@@ -295,49 +295,48 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      # Preserve the matrix's separate rate-limit tokens while sharing the
-      # expensive runner setup below.
-      - parallel:
-          - name: Fetch token 0
-            id: token_0
-            uses: ./.github/actions/fetch-token
-            with:
-              api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
-          - name: Fetch token 1
-            id: token_1
-            uses: ./.github/actions/fetch-token
-            with:
-              api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
-          - name: Fetch token 2
-            id: token_2
-            uses: ./.github/actions/fetch-token
-            with:
-              api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
-          - name: Fetch token 3
-            id: token_3
-            uses: ./.github/actions/fetch-token
-            with:
-              api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
-          - name: Fetch token 4
-            id: token_4
-            uses: ./.github/actions/fetch-token
-            with:
-              api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
-          - name: Fetch token 5
-            id: token_5
-            uses: ./.github/actions/fetch-token
-            with:
-              api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
-          - name: Fetch token 6
-            id: token_6
-            uses: ./.github/actions/fetch-token
-            with:
-              api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
-          - name: Fetch token 7
-            id: token_7
-            uses: ./.github/actions/fetch-token
-            with:
-              api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
+      # Fetch sequentially so the pool can rotate its cursor between requests.
+      # Each token is also rejected by the action when its core budget is empty.
+      - name: Fetch token 0
+        id: token_0
+        uses: ./.github/actions/fetch-token
+        with:
+          api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
+      - name: Fetch token 1
+        id: token_1
+        uses: ./.github/actions/fetch-token
+        with:
+          api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
+      - name: Fetch token 2
+        id: token_2
+        uses: ./.github/actions/fetch-token
+        with:
+          api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
+      - name: Fetch token 3
+        id: token_3
+        uses: ./.github/actions/fetch-token
+        with:
+          api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
+      - name: Fetch token 4
+        id: token_4
+        uses: ./.github/actions/fetch-token
+        with:
+          api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
+      - name: Fetch token 5
+        id: token_5
+        uses: ./.github/actions/fetch-token
+        with:
+          api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
+      - name: Fetch token 6
+        id: token_6
+        uses: ./.github/actions/fetch-token
+        with:
+          api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
+      - name: Fetch token 7
+        id: token_7
+        uses: ./.github/actions/fetch-token
+        with:
+          api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: mise-ubuntu-latest
