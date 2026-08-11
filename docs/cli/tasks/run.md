@@ -85,6 +85,10 @@ Change to this directory before executing the command
 
 Force the tasks to run even if outputs are up to date
 
+### `--if-present`
+
+Ignore task names and patterns that do not match any tasks
+
 ### `-j --jobs <JOBS>`
 
 Number of tasks to run in parallel
