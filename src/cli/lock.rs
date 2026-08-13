@@ -178,7 +178,10 @@ impl Lock {
         let lock_resolve_options = ResolveOptions {
             before_date,
             filter_installed_versions_by_release_date: true,
-            latest_versions: self.bump,
+            // Existing lock entries still win unless --bump disables them. For a
+            // selector without a lock entry, resolve moving selectors instead of
+            // reusing an arbitrary installed build.
+            latest_versions: true,
             use_locked_version: !self.bump,
             ..Default::default()
         };
