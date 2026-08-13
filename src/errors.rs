@@ -156,6 +156,17 @@ impl Error {
             })
             .unwrap_or(false)
     }
+
+    pub fn is_required_channel_resolution_err(err: &Report) -> bool {
+        matches!(
+            err.downcast_ref::<Error>(),
+            Some(Error::FailedToResolveVersion { tr, .. })
+                if tr
+                    .ba()
+                    .backend()
+                    .is_ok_and(|backend| backend.requires_concrete_channel_version(&tr.version()))
+        )
+    }
 }
 
 #[cfg(all(test, unix))]
