@@ -64,6 +64,13 @@ Install tools from every [monorepo].config_roots config root
 Uses the active MISE_ENV and requires monorepo_root = true plus explicit
 [monorepo].config_roots in the monorepo root config.
 
+### `--include-task-tools`
+
+Also install tools required by tasks in the current scope
+
+This prepares task tools without running task commands or dependencies.
+Combine with --monorepo to include tasks from every configured root.
+
 ### `--raw`
 
 Connect backend install command stdin/stdout/stderr directly to the terminal Implies --jobs=1
@@ -89,4 +96,5 @@ mise install node@20.0.0  # install specific node version
 mise install node@20      # install fuzzy node version
 mise install node         # install version specified in mise.toml
 mise install              # installs everything specified in mise.toml
+mise install --include-task-tools # also install tools required by tasks
 ```

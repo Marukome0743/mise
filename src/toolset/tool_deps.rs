@@ -1,18 +1,38 @@
 use std::collections::HashSet;
+use std::fmt;
 
 use eyre::Result;
 use tokio::sync::mpsc;
 
 use crate::cli::args::BackendArg;
 use crate::deps_graph::DepsGraph;
+use crate::toolset::ToolVersionOptions;
 use crate::toolset::tool_request::ToolRequest;
 
-/// Unique key for a tool request (tool short name + version)
-pub type ToolKey = String;
+/// Unique identity for an install request. Tool options can select a different
+/// artifact even when the backend and version strings are the same.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct ToolKey {
+    short: String,
+    backend: String,
+    version: String,
+    options: ToolVersionOptions,
+}
+
+impl fmt::Display for ToolKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.short, self.version)
+    }
+}
 
 /// Creates a unique key for a ToolRequest
 pub(crate) fn tool_key(tr: &ToolRequest) -> ToolKey {
-    format!("{}@{}", tr.ba().short, tr.version())
+    ToolKey {
+        short: tr.ba().short.clone(),
+        backend: tr.ba().full(),
+        version: tr.version(),
+        options: tr.options(),
+    }
 }
 
 /// Manages a dependency graph of tools for installation scheduling.
@@ -26,7 +46,7 @@ pub struct ToolDeps {
 impl ToolDeps {
     /// Creates a new ToolDeps from a list of tool requests.
     /// Builds the dependency graph based on each tool's dependencies.
-    /// Duplicate tool requests (same tool short name and version) are deduplicated.
+    /// Duplicate tool requests (same tool, version, and options) are deduplicated.
     /// Distinct aliases may resolve to the same backend/version but still need separate
     /// install jobs because they can have different options and install directories.
     pub fn new(requests: Vec<ToolRequest>) -> Result<Self> {
@@ -124,7 +144,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::config::Config;
-    use crate::toolset::{ToolSource, ToolVersionOptions};
+    use crate::toolset::{ToolSource, ToolVersionOptions, parse_tool_options};
 
     #[test]
     fn test_empty_deps() {
@@ -167,5 +187,35 @@ mod tests {
 
         emitted.sort();
         assert_eq!(emitted, vec!["bar".to_string(), "foo".to_string()]);
+    }
+
+    #[test]
+    fn test_same_tool_and_version_with_different_options_are_distinct() {
+        let backend = Arc::new(BackendArg::from("tiny"));
+        let requests = vec![
+            ToolRequest::new_opts(
+                backend.clone(),
+                "1.0.0",
+                parse_tool_options("flavor=one"),
+                ToolSource::Argument,
+            )
+            .unwrap(),
+            ToolRequest::new_opts(
+                backend,
+                "1.0.0",
+                parse_tool_options("flavor=two"),
+                ToolSource::Argument,
+            )
+            .unwrap(),
+        ];
+
+        let mut deps = ToolDeps::new(requests).unwrap();
+        let mut rx = deps.subscribe();
+        let mut emitted = 0;
+        while let Ok(Some(_)) = rx.try_recv() {
+            emitted += 1;
+        }
+
+        assert_eq!(emitted, 2);
     }
 }

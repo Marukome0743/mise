@@ -17,7 +17,7 @@ use crate::registry::REGISTRY;
 use crate::toolset::Toolset;
 use crate::toolset::helpers::{preflight_system_deps, show_python_install_hint};
 use crate::toolset::install_options::InstallOptions;
-use crate::toolset::tool_deps::{ToolDeps, tool_key};
+use crate::toolset::tool_deps::{ToolDeps, ToolKey, tool_key};
 use crate::toolset::tool_request::ToolRequest;
 use crate::toolset::tool_source::ToolSource;
 use crate::toolset::tool_version::{ResolveOptions, ToolVersion};
@@ -381,7 +381,7 @@ impl Toolset {
         }
 
         // Build index map to preserve original request order
-        let request_order: HashMap<String, usize> = versions
+        let request_order: HashMap<ToolKey, usize> = versions
             .iter()
             .enumerate()
             .map(|(i, tr)| (tool_key(tr), i))
