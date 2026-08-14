@@ -35,11 +35,13 @@ pub struct InstallStateTool {
     pub versions: Vec<String>,
     pub explicit_backend: bool,
     pub opts: BTreeMap<String, toml::Value>,
+    pub version_backends: BTreeMap<String, String>,
     pub installs_path: Option<PathBuf>,
 }
 
 /// Entry in the consolidated manifest file (.mise-installs.toml).
-/// Versions are NOT stored here — they come from the filesystem.
+/// Version directories remain the inventory source of truth; `version_backends`
+/// only records which backend produced versions that still exist on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestTool {
     /// Original short name (e.g. "github:jdx/mise-test-fixtures").
@@ -51,6 +53,8 @@ struct ManifestTool {
     explicit_backend: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     opts: BTreeMap<String, toml::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    version_backends: BTreeMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -290,6 +294,7 @@ async fn init_tools() -> MutexResult<InstallStateTools> {
                         full: full.clone(),
                         explicit_backend: mt.explicit_backend,
                         opts: opts.clone(),
+                        version_backends: mt.version_backends.clone(),
                     },
                 );
             }
@@ -304,6 +309,7 @@ async fn init_tools() -> MutexResult<InstallStateTools> {
                     full: full.clone(),
                     explicit_backend: explicit,
                     opts: BTreeMap::new(),
+                    version_backends: BTreeMap::new(),
                 },
             );
             (s, full, explicit, BTreeMap::new())
@@ -311,12 +317,22 @@ async fn init_tools() -> MutexResult<InstallStateTools> {
             (dir_name.clone(), None, true, BTreeMap::new())
         };
 
+        let version_backends = versions
+            .iter()
+            .filter_map(|version| {
+                let backend = manifest_tool
+                    .and_then(|tool| tool.version_backends.get(version).cloned())
+                    .or_else(|| full.clone())?;
+                Some((version.clone(), backend))
+            })
+            .collect();
         let tool = InstallStateTool {
             short: short.clone(),
             full,
             versions,
             explicit_backend,
             opts,
+            version_backends,
             installs_path: Some(dir),
         };
         time!("init_tools {short}");
@@ -393,11 +409,18 @@ async fn init_tools() -> MutexResult<InstallStateTools> {
                     versions: Vec::new(),
                     explicit_backend,
                     opts: opts.clone(),
+                    version_backends: BTreeMap::new(),
                     installs_path: Some(dir),
                 });
             // Add versions from shared dir that aren't already present
             for v in versions {
                 if !tool.versions.contains(&v) {
+                    if let Some(backend) = manifest_tool
+                        .and_then(|mt| mt.version_backends.get(&v).cloned())
+                        .or_else(|| full.clone())
+                    {
+                        tool.version_backends.insert(v.clone(), backend);
+                    }
                     tool.versions.push(v);
                 }
             }
@@ -428,6 +451,7 @@ async fn init_tools() -> MutexResult<InstallStateTools> {
                 versions: Default::default(),
                 explicit_backend: true,
                 opts: BTreeMap::new(),
+                version_backends: BTreeMap::new(),
                 installs_path: None,
             });
         tool.full = Some(full);
@@ -463,6 +487,17 @@ fn is_banned_plugin(path: &Path) -> bool {
 
 pub fn get_tool_full(short: &str) -> Option<String> {
     list_tools().get(short).and_then(|t| t.full.clone())
+}
+
+/// Returns the backend that installed a concrete version, falling back to the
+/// tool-level backend recorded by legacy manifests.
+pub fn get_version_backend(short: &str, version: &str) -> Option<String> {
+    try_list_tools()?.get(short).and_then(|tool| {
+        tool.version_backends
+            .get(version)
+            .cloned()
+            .or_else(|| tool.full.clone())
+    })
 }
 
 pub fn get_plugin_type(short: &str) -> Option<PluginType> {
@@ -530,16 +565,13 @@ pub fn add_tool_version(ba: &BackendArg, install_path: &Path, version: &str) {
             versions: Vec::new(),
             explicit_backend,
             opts: opts.clone(),
+            version_backends: BTreeMap::new(),
             installs_path: tool_dir.clone(),
         });
 
-    if tool.full.is_none() {
-        tool.full = Some(full);
-    }
+    tool.full = Some(full.clone());
     tool.explicit_backend = explicit_backend;
-    if tool.opts.is_empty() {
-        tool.opts = opts;
-    }
+    tool.opts = opts;
     if tool.installs_path.is_none() {
         tool.installs_path = tool_dir;
     }
@@ -549,6 +581,7 @@ pub fn add_tool_version(ba: &BackendArg, install_path: &Path, version: &str) {
         // see that concrete result without adding another ordering rule.
         tool.versions.push(version.to_string());
     }
+    tool.version_backends.insert(version.to_string(), full);
 
     *tools = Some(Arc::new(next_tools));
 }
@@ -564,31 +597,59 @@ pub async fn add_plugin(short: &str, plugin_type: PluginType) -> Result<()> {
 
 /// Writes backend metadata to the consolidated manifest file.
 /// Uses the primary installs dir manifest by default.
-pub fn write_backend_meta(ba: &BackendArg) -> Result<()> {
-    write_backend_meta_to(ba, &manifest_path())
+pub fn write_backend_meta(ba: &BackendArg, version: &str) -> Result<()> {
+    write_backend_meta_to(ba, &manifest_path(), version)
 }
 
 /// Writes backend metadata to a manifest at a specific install path.
-pub fn write_backend_meta_to(ba: &BackendArg, path: &Path) -> Result<()> {
+pub fn write_backend_meta_to(ba: &BackendArg, path: &Path, version: &str) -> Result<()> {
     let full = ba.full_without_opts();
     let explicit = ba.has_explicit_backend();
     let opts_map = persistent_opts(ba);
 
     let _lock = MANIFEST_LOCK.lock().expect("MANIFEST_LOCK lock failed");
     let mut manifest = read_manifest_from(path);
+    let tool_manifest = path
+        .parent()
+        .map(|installs_dir| tool_manifest_path(installs_dir, &ba.short));
+    let previous = tool_manifest
+        .as_deref()
+        .and_then(read_tool_manifest_from)
+        .or_else(|| manifest.get(&ba.short.to_kebab_case()).cloned());
+    let mut version_backends = previous
+        .as_ref()
+        .map(|tool| tool.version_backends.clone())
+        .unwrap_or_default();
+    if let Some(previous_full) = previous.as_ref().and_then(|tool| tool.full.clone())
+        && let Some(installs_dir) = path.parent()
+    {
+        let tool_dir = installs_dir.join(ba.short.to_kebab_case());
+        for existing_version in file::dir_subdirs(&tool_dir).unwrap_or_default() {
+            if existing_version.starts_with('.')
+                || runtime_symlinks::is_runtime_symlink(&tool_dir.join(&existing_version))
+                || tool_dir.join(&existing_version).join("incomplete").exists()
+            {
+                continue;
+            }
+            version_backends
+                .entry(existing_version)
+                .or_insert_with(|| previous_full.clone());
+        }
+    }
+    version_backends.insert(version.to_string(), full.clone());
     let manifest_tool = ManifestTool {
         short: ba.short.clone(),
         full: Some(full),
         explicit_backend: explicit,
         opts: opts_map,
+        version_backends,
     };
     manifest.insert(ba.short.to_kebab_case(), manifest_tool.clone());
     write_manifest_to(path, &manifest)?;
-    if let Some(installs_dir) = path.parent() {
-        let tool_manifest = tool_manifest_path(installs_dir, &ba.short);
-        if tool_manifest.parent().is_some_and(|p| p.exists()) {
-            write_tool_manifest_to(&tool_manifest, &manifest_tool)?;
-        }
+    if let Some(tool_manifest) = tool_manifest
+        && tool_manifest.parent().is_some_and(|p| p.exists())
+    {
+        write_tool_manifest_to(&tool_manifest, &manifest_tool)?;
     }
     Ok(())
 }
@@ -695,8 +756,10 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::{
-        lock_tool_version, normalize_version_for_sort, read_tool_manifest_from, tool_version_lock,
+        lock_tool_version, normalize_version_for_sort, read_manifest_from, read_tool_manifest_from,
+        tool_version_lock, write_backend_meta_to,
     };
+    use crate::cli::args::BackendArg;
     use itertools::Itertools;
     use std::collections::BTreeMap;
     use std::sync::mpsc;
@@ -798,6 +861,7 @@ mod tests {
                 full: Some("core:node".to_string()),
                 explicit_backend: true,
                 opts: BTreeMap::new(),
+                version_backends: BTreeMap::from([("22.0.0".to_string(), "core:node".to_string())]),
             },
         );
         manifest.insert(
@@ -807,6 +871,7 @@ mod tests {
                 full: Some("aqua:oven-sh/bun".to_string()),
                 explicit_backend: false,
                 opts: BTreeMap::new(),
+                version_backends: BTreeMap::new(),
             },
         );
         manifest.insert(
@@ -816,6 +881,7 @@ mod tests {
                 full: None,
                 explicit_backend: true,
                 opts: BTreeMap::new(),
+                version_backends: BTreeMap::new(),
             },
         );
 
@@ -825,6 +891,10 @@ mod tests {
         assert_eq!(deserialized.len(), 3);
         assert_eq!(deserialized["node"].full.as_deref(), Some("core:node"));
         assert!(deserialized["node"].explicit_backend);
+        assert_eq!(
+            deserialized["node"].version_backends.get("22.0.0"),
+            Some(&"core:node".to_string())
+        );
         assert_eq!(
             deserialized["bun"].full.as_deref(),
             Some("aqua:oven-sh/bun")
@@ -866,6 +936,7 @@ mod tests {
                 full: Some("http:hello".to_string()),
                 explicit_backend: true,
                 opts,
+                version_backends: BTreeMap::new(),
             },
         );
 
@@ -908,6 +979,38 @@ explicit_backend = true
         let mt = &manifest["hello"];
         // Old format should deserialize with opts empty and brackets in full
         assert!(mt.opts.is_empty());
+        assert!(mt.version_backends.is_empty());
         assert!(mt.full.as_ref().unwrap().contains('['));
+    }
+
+    #[test]
+    fn backend_change_preserves_other_version_identities() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let installs_dir = tempdir.path().join("installs");
+        let tool_dir = installs_dir.join("bd");
+        std::fs::create_dir_all(tool_dir.join("1.0.0")).unwrap();
+        std::fs::create_dir_all(tool_dir.join("2.0.0")).unwrap();
+        let manifest_path = installs_dir.join(".mise-installs.toml");
+
+        let old_backend = BackendArg::new("bd".into(), Some("asdf:backend-a".into()));
+        write_backend_meta_to(&old_backend, &manifest_path, "1.0.0").unwrap();
+
+        let new_backend = BackendArg::new("bd".into(), Some("asdf:backend-b".into()));
+        write_backend_meta_to(&new_backend, &manifest_path, "1.0.0").unwrap();
+
+        let manifest = read_manifest_from(&manifest_path);
+        let tool = &manifest["bd"];
+        assert_eq!(tool.full.as_deref(), Some("asdf:backend-b"));
+        assert_eq!(
+            tool.version_backends.get("1.0.0").map(String::as_str),
+            Some("asdf:backend-b")
+        );
+        assert_eq!(
+            tool.version_backends.get("2.0.0").map(String::as_str),
+            Some("asdf:backend-a")
+        );
+
+        let sidecar = read_tool_manifest_from(&tool_dir.join(".mise.backend.toml")).unwrap();
+        assert_eq!(sidecar.version_backends, tool.version_backends);
     }
 }
