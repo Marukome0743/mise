@@ -18,6 +18,12 @@ Any method of installing `go` is fine if you want to install go some other way.
 mise will use whatever `go` is on PATH.
 :::
 
+When Go is configured through mise, the backend records the concrete Go version used to build
+each command. Changing the configured Go version causes existing `go:` tools to be rebuilt the
+next time mise installs missing tools. Existing installs created before this metadata was added
+are rebuilt once to record their compiler. Go installations supplied only through `PATH` keep the
+legacy path-based install check.
+
 ## Usage
 
 The following installs the latest version of [hivemind](https://github.com/DarthSim/hivemind) and
