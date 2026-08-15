@@ -9,6 +9,7 @@ mod edit;
 mod graph;
 mod info;
 mod ls;
+mod usage;
 mod validate;
 
 /// Manage tasks
@@ -34,6 +35,8 @@ enum Commands {
     Info(info::TasksInfo),
     Ls(ls::TasksLs),
     Run(Box<run::Run>),
+    #[clap(name = "__usage", hide = true)]
+    Usage(usage::TasksUsage),
     Validate(validate::TasksValidate),
 }
 
@@ -47,6 +50,7 @@ impl Commands {
             Self::Info(cmd) => cmd.run().await,
             Self::Ls(cmd) => cmd.run().await,
             Self::Run(cmd) => (*cmd).run().await,
+            Self::Usage(cmd) => cmd.run().await,
             Self::Validate(cmd) => cmd.run().await,
         }
     }
