@@ -2020,6 +2020,18 @@ impl TaskExecutor {
             "MISE_TASK_NAME",
             task.name.clone(),
         );
+        let task_color =
+            if self.output(Some(task)).displays_task_prefix() && console::colors_enabled_stderr() {
+                style::prefix_ansi(&task.display_name)
+            } else {
+                String::new()
+            };
+        Self::insert_env_excluded_from_nested_mise_diff(
+            &mut env,
+            &mut nested_mise_diff_exclude_keys,
+            "MISE_TASK_COLOR",
+            task_color,
+        );
         let task_file = task
             .file_path(config)
             .await?
