@@ -153,6 +153,11 @@ impl MultiProgressReport {
         self.add_with_options(prefix, false)
     }
 
+    /// Whether reports use the interactive renderer that consistently preserves styled prefixes.
+    pub(crate) fn uses_progress_ui(&self) -> bool {
+        self.use_progress_ui
+    }
+
     /// Create a progress report before backends are loaded, when normal prefix sizing is unavailable.
     pub(crate) fn add_pre_backend(&self, prefix: &str) -> Box<dyn SingleReport> {
         if self.quiet {

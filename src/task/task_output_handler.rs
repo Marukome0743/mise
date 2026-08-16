@@ -4,6 +4,7 @@ use crate::task::task_output::TaskOutput;
 use crate::task::{Task, TaskCacheOutput};
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
+use crate::ui::style;
 use indexmap::IndexMap;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -223,6 +224,33 @@ impl OutputHandler {
             prs.insert(task.clone(), pr.clone());
             pr
         }
+    }
+
+    /// Return the task prefix's ANSI opening sequence when the selected output
+    /// path actually preserves the styled prefix.
+    pub fn task_prefix_color(&self, task: &Task) -> String {
+        if self.quiet(Some(task)) {
+            return String::new();
+        }
+
+        let output = self.output(Some(task));
+        let replacing_uses_progress_ui =
+            output == TaskOutput::Replacing && MultiProgressReport::get().uses_progress_ui();
+        if console::colors_enabled_stderr()
+            && displays_colored_task_prefix(output, replacing_uses_progress_ui)
+        {
+            style::prefix_ansi(&task.display_name)
+        } else {
+            String::new()
+        }
+    }
+}
+
+fn displays_colored_task_prefix(output: TaskOutput, replacing_uses_progress_ui: bool) -> bool {
+    match output {
+        TaskOutput::Prefix | TaskOutput::KeepOrder | TaskOutput::Timed => true,
+        TaskOutput::Replacing => replacing_uses_progress_ui,
+        TaskOutput::Interleave | TaskOutput::Quiet | TaskOutput::Silent => false,
     }
 }
 
@@ -450,6 +478,22 @@ impl OutputHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colored_prefix_modes_require_a_rendered_style() {
+        for output in [TaskOutput::Prefix, TaskOutput::KeepOrder, TaskOutput::Timed] {
+            assert!(displays_colored_task_prefix(output, false));
+        }
+        assert!(displays_colored_task_prefix(TaskOutput::Replacing, true));
+        assert!(!displays_colored_task_prefix(TaskOutput::Replacing, false));
+        for output in [
+            TaskOutput::Interleave,
+            TaskOutput::Quiet,
+            TaskOutput::Silent,
+        ] {
+            assert!(!displays_colored_task_prefix(output, true));
+        }
+    }
 
     #[test]
     fn cached_timed_output_preserves_all_stdout_lines() {
