@@ -56,5 +56,9 @@ The following environment variables are passed to the task:
 - `MISE_PROJECT_ROOT`: The root of the project that defines the task. For monorepo subproject tasks this is the subproject's directory and is stable regardless of the directory the task is invoked from.
 - `MISE_MONOREPO_ROOT`: The root of the monorepo (the directory containing the config with `monorepo_root = true`). Only set inside a monorepo.
 - `MISE_TASK_NAME`: The name of the task being run.
+- `MISE_TASK_COLOR`: The ANSI sequence that starts the task's prefix color and emphasis. This is
+  set to an empty string when colors are disabled or the selected output mode does not display a
+  task prefix. Add an ANSI reset after the text, for example
+  `printf '%smessage\033[0m\n' "$MISE_TASK_COLOR"`.
 - `MISE_TASK_DIR`: The directory containing the task script.
 - `MISE_TASK_FILE`: The full path to the task script.

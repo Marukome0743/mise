@@ -55,6 +55,38 @@ impl TaskOutput {
             style
         }
     }
+
+    /// Whether this output style displays mise's styled task label.
+    pub(crate) fn displays_task_prefix(self) -> bool {
+        matches!(
+            self,
+            TaskOutput::Prefix | TaskOutput::KeepOrder | TaskOutput::Replacing | TaskOutput::Timed
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_prefix_display_modes() {
+        for output in [
+            TaskOutput::Prefix,
+            TaskOutput::KeepOrder,
+            TaskOutput::Replacing,
+            TaskOutput::Timed,
+        ] {
+            assert!(output.displays_task_prefix());
+        }
+        for output in [
+            TaskOutput::Interleave,
+            TaskOutput::Quiet,
+            TaskOutput::Silent,
+        ] {
+            assert!(!output.displays_task_prefix());
+        }
+    }
 }
 
 /// Returns the first line of a message for display unless task_show_full_cmd is true
