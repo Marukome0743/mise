@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Landlock binds each rule to an open descriptor, so an allow-list entry that
+# does not exist yet has its rule dropped and the task is then denied. Say that
+# once per path, with the way out. https://github.com/jdx/mise/discussions/10556
+
+if [[ "$(uname)" != "Linux" ]]; then
+  echo "skipping: Landlock filesystem sandboxing is Linux-only"
+  exit 0
+fi
+
+cat >mise.toml <<'TOML'
+[tasks.create]
+run = "touch test.txt"
+allow_read = ["test.txt"]
+allow_write = ["test.txt"]
+TOML
+
+# The task itself is expected to be denied; the message is what is under test.
+mise run create >out.log 2>&1 || true
+
+assert_contains "cat out.log" "does not exist, so its rule was dropped"
+assert_contains "cat out.log" "allow the parent directory instead"
+
+# The same path sits in both allow-lists. It used to be reported once per list.
+assert "test \"\$(grep -c 'its rule was dropped' out.log)\" = 1"

@@ -120,6 +120,50 @@ impl SandboxConfig {
         self.deny_env || !self.allow_env.is_empty()
     }
 
+    /// Allow-list paths that do not exist, in declaration order and listed once
+    /// even when named by both `allow_read` and `allow_write`.
+    ///
+    /// Landlock binds a rule to an open descriptor, so it cannot name a path
+    /// that is not there yet and the rule is dropped — see
+    /// <https://github.com/jdx/mise/discussions/10556>. Not gated on Linux:
+    /// this is only a set of existence checks, and keeping it portable keeps it
+    /// testable on any host.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn missing_allow_paths(&self) -> Vec<&std::path::Path> {
+        let mut seen = std::collections::HashSet::new();
+        self.allow_read
+            .iter()
+            .chain(self.allow_write.iter())
+            .filter(|path| !path.exists())
+            .filter(|path| seen.insert(path.as_path()))
+            .map(|path| path.as_path())
+            .collect()
+    }
+
+    /// Report dropped rules before the sandbox starts denying things.
+    ///
+    /// Reported from the parent rather than from `add_path_rule`, which runs
+    /// inside `pre_exec` — after fork, where the logger is not available and
+    /// the same path warns once per allow-list it appears in.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn warn_missing_allow_paths(&self) {
+        for path in self.missing_allow_paths() {
+            let workaround = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => format!(
+                    "To let the task create it, allow the parent directory instead: {}",
+                    crate::file::display_path(parent)
+                ),
+                _ => "To let the task create it, allow the directory that will contain it."
+                    .to_string(),
+            };
+            warn!(
+                "sandbox: {} does not exist, so its rule was dropped.\n\
+                 Landlock can only bind rules to paths that already exist. {workaround}",
+                crate::file::display_path(path)
+            );
+        }
+    }
+
     /// Filter environment variables based on sandbox config.
     ///
     /// When deny_env is active, starts with the mise-computed env (tool paths etc.),
@@ -196,6 +240,7 @@ impl SandboxConfig {
 
         #[cfg(target_os = "linux")]
         {
+            self.warn_missing_allow_paths();
             self.apply_linux()?;
             Ok(None)
         }
@@ -284,6 +329,39 @@ mod tests {
     use super::*;
     use crate::config::settings::SettingsSandbox;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn test_missing_allow_paths_lists_each_absent_path_once() {
+        // Landlock drops a rule naming a path that is not there yet, and the
+        // same path commonly appears in both allow-lists — the report in
+        // discussion #10556 shows the warning printed twice for one path.
+        let existing = std::env::temp_dir();
+        let missing_a = existing.join("mise-10556-missing-a");
+        let missing_b = existing.join("mise-10556-missing-b");
+        assert!(existing.exists(), "temp_dir should exist");
+        assert!(!missing_a.exists(), "fixture path should not exist");
+        assert!(!missing_b.exists(), "fixture path should not exist");
+
+        let config = SandboxConfig {
+            allow_read: vec![existing.clone(), missing_a.clone(), missing_b.clone()],
+            allow_write: vec![missing_a.clone(), existing],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.missing_allow_paths(),
+            vec![missing_a.as_path(), missing_b.as_path()]
+        );
+    }
+
+    #[test]
+    fn test_missing_allow_paths_is_empty_when_everything_exists() {
+        let config = SandboxConfig {
+            allow_write: vec![std::env::temp_dir()],
+            ..Default::default()
+        };
+        assert!(config.missing_allow_paths().is_empty());
+    }
 
     #[test]
     fn test_env_pattern_matches_exact() {
