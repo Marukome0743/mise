@@ -34,6 +34,7 @@ use crate::config::{Config, ConfigMap};
 use crate::file;
 use crate::path::PathExt;
 use crate::system::files::FileState;
+use crate::system::resources::ResourceOrigin;
 use crate::ui::prompt;
 
 /// one `[dotfiles]` edit entry as written in mise.toml. Operations stay loosely typed so configs using operations
@@ -41,7 +42,7 @@ use crate::ui::prompt;
 /// operation warn and are skipped)
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-pub enum EditTomlEntry {
+pub(crate) enum EditTomlEntry {
     /// `activate = 'eval "$(mise activate zsh)"'` — inline block content
     Block(String),
     /// `aliases = { source = "...", template = "tera" }` /
@@ -50,7 +51,7 @@ pub enum EditTomlEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct EditTomlTable {
+pub(crate) struct EditTomlTable {
     /// inline block content
     #[serde(default)]
     pub block: Option<String>,
@@ -72,15 +73,15 @@ pub struct EditTomlTable {
 }
 
 /// where a block's content comes from
-#[derive(Debug, Clone)]
-pub enum BlockSource {
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum BlockSource {
     Inline(String),
     /// absolute path, resolved against the declaring config file
     File(PathBuf),
 }
 
-#[derive(Debug, Clone)]
-pub enum EditOp {
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum EditOp {
     Block {
         source: BlockSource,
         template: bool,
@@ -93,7 +94,7 @@ pub enum EditOp {
 
 /// one edit, resolved against the config file that declared it
 #[derive(Debug, Clone)]
-pub struct EditRequest {
+pub(crate) struct EditRequest {
     /// target path as written in config (display)
     pub path_raw: String,
     /// absolute target path (`~` expanded)
@@ -107,23 +108,24 @@ pub struct EditRequest {
     pub base: PathBuf,
     /// config file that declared this edit
     pub config_path: PathBuf,
+    pub origin: ResourceOrigin,
 }
 
 impl EditRequest {
     /// short operation label for status tables and dry-run output
-    pub fn describe_op(&self) -> String {
+    pub(crate) fn describe_op(&self) -> String {
         match &self.op {
             EditOp::Block { .. } => format!("block:{}", self.id),
             EditOp::Line { .. } => format!("line:{}", self.id),
         }
     }
 
-    pub fn config_key(&self) -> String {
+    pub(crate) fn config_key(&self) -> String {
         format!("{}/{}", self.path_raw.trim_end_matches('/'), self.id)
     }
 }
 
-pub fn matches_target(req: &EditRequest, filters: &[String]) -> bool {
+pub(crate) fn matches_target(req: &EditRequest, filters: &[String]) -> bool {
     filters.is_empty()
         || filters.iter().any(|filter| {
             filter == &req.path_raw
@@ -145,11 +147,41 @@ pub fn matches_target(req: &EditRequest, filters: &[String]) -> bool {
 /// Aggregate edit `[dotfiles]` entries across all loaded config files. Entries
 /// union global -> local, keyed by `(path, id)`; a more local config overrides
 /// an edit with the same id. Malformed entries warn and are skipped.
-pub fn edits_from_config(config: &Config) -> Vec<EditRequest> {
-    edits_from_config_files(&config.config_files)
+pub(crate) fn edits_from_config(config: &Config) -> Result<Vec<EditRequest>> {
+    let mut composed: IndexMap<String, EditRequest> = IndexMap::new();
+    for config_files in config.bootstrap_config_maps() {
+        for request in edits_from_config_files(config_files) {
+            let key = format!("{}\u{0}{}", request.path.display(), request.id);
+            if let Some(existing) = composed.get(&key) {
+                if edit_requests_match(config, existing, &request) {
+                    continue;
+                }
+                bail!(
+                    "conflicting dotfile edit declarations for {}/{}\n\n  first:\n    {}\n\n  second:\n    {}",
+                    request.path.display(),
+                    request.id,
+                    existing.origin.conflict_description(),
+                    request.origin.conflict_description(),
+                );
+            }
+            composed.insert(key, request);
+        }
+    }
+    Ok(composed.into_values().collect())
 }
 
-pub fn edits_from_config_files(config_files: &ConfigMap) -> Vec<EditRequest> {
+/// Returns whether sibling declarations produce the same file edit.
+fn edit_requests_match(config: &Config, first: &EditRequest, second: &EditRequest) -> bool {
+    first.path == second.path
+        && first.id == second.id
+        && first.op == second.op
+        && (!matches!(first.op, EditOp::Block { template: true, .. })
+            || first.base == second.base
+                && config.bootstrap_tera_ctx(&first.origin.config)
+                    == config.bootstrap_tera_ctx(&second.origin.config))
+}
+
+pub(crate) fn edits_from_config_files(config_files: &ConfigMap) -> Vec<EditRequest> {
     let mut merged: IndexMap<String, EditRequest> = IndexMap::new();
     // config_files is ordered local -> global; reverse for global -> local
     for (cf_path, cf) in config_files.iter().rev() {
@@ -228,6 +260,12 @@ fn resolve_entry(
             "\"{path_raw}\".{id:?}: ids may only contain letters, digits, '_', '-', and '.', ignoring entry"
         );
     }
+    let mut origin = ResourceOrigin {
+        config: config_path.to_path_buf(),
+        config_root: crate::config::config_file::config_root::config_root(config_path),
+        environment: crate::config::environments_for_config_path(config_path),
+        source: None,
+    };
     let entry = match entry {
         EditTomlEntry::Block(inline) => EditTomlTable {
             block: Some(inline),
@@ -260,11 +298,13 @@ fn resolve_entry(
                 (Some(inline), None) => BlockSource::Inline(inline),
                 (None, Some(src)) => {
                     let src = file::replace_path(&src);
-                    BlockSource::File(if src.is_relative() {
+                    let src = if src.is_relative() {
                         base.join(src)
                     } else {
                         src
-                    })
+                    };
+                    origin.source = Some(src.clone());
+                    BlockSource::File(src)
                 }
                 (None, None) => unreachable!("is_block"),
             };
@@ -305,6 +345,7 @@ fn resolve_entry(
         op,
         base: base.to_path_buf(),
         config_path: config_path.to_path_buf(),
+        origin,
     })
 }
 
@@ -396,7 +437,12 @@ fn desired_content(config: &Config, req: &EditRequest) -> Result<Option<String>>
     };
     let content = if *template {
         let mut tera = crate::tera::get_tera(Some(&req.base));
-        crate::tera::render_str(&mut tera, &raw, &config.tera_ctx).map_err(|err| {
+        crate::tera::render_str(
+            &mut tera,
+            &raw,
+            config.bootstrap_tera_ctx(&req.origin.config),
+        )
+        .map_err(|err| {
             eyre::eyre!(
                 "[dotfiles].\"{}/{}\": failed to render template: {err}",
                 req.path_raw,
@@ -429,7 +475,7 @@ fn desired_content(config: &Config, req: &EditRequest) -> Result<Option<String>>
 /// templates. Rendering only happens once every render-free outcome (symlink
 /// target, missing file, absent or corrupted markers) has been ruled out,
 /// and `--dry-run` skips template rendering entirely (see [`apply`]).
-pub fn check(config: &Config, req: &EditRequest) -> Result<FileState> {
+pub(crate) fn check(config: &Config, req: &EditRequest) -> Result<FileState> {
     if let EditOp::Block {
         source: BlockSource::File(p),
         ..
@@ -510,7 +556,7 @@ fn block_state(req: &EditRequest, desired: Option<&str>) -> Result<FileState> {
     }
 }
 
-pub struct ApplyOpts {
+pub(crate) struct ApplyOpts {
     pub dry_run: bool,
     pub verbose: bool,
     pub yes: bool,
@@ -520,7 +566,7 @@ pub struct ApplyOpts {
 /// replace files, so there is no --force here — but corrupted markers and
 /// symlink targets are reported as errors rather than guessed at. Returns
 /// `false` when the user declines the confirmation prompt.
-pub fn apply(config: &Config, requests: &[EditRequest], opts: &ApplyOpts) -> Result<bool> {
+pub(crate) fn apply(config: &Config, requests: &[EditRequest], opts: &ApplyOpts) -> Result<bool> {
     let mut todo: Vec<(&EditRequest, Option<String>)> = vec![];
     let mut problems = vec![];
     for req in requests {
@@ -651,7 +697,7 @@ pub fn apply(config: &Config, requests: &[EditRequest], opts: &ApplyOpts) -> Res
     Ok(true)
 }
 
-pub struct UnapplyOpts {
+pub(crate) struct UnapplyOpts {
     pub dry_run: bool,
     pub verbose: bool,
     /// plain line edits have no ownership marker, so removing them requires
@@ -660,7 +706,7 @@ pub struct UnapplyOpts {
     pub yes: bool,
 }
 
-pub struct UnapplyPlan<'a> {
+pub(crate) struct UnapplyPlan<'a> {
     req: &'a EditRequest,
     /// Exact target contents observed during planning. Template functions run
     /// before execution, so selected edits must still have this same state.
@@ -670,7 +716,7 @@ pub struct UnapplyPlan<'a> {
 /// Remove marker-delimited blocks and, with `--force`, exact line edits.
 /// Block markers are their ownership record. A plain line may have existed
 /// before apply, so stateless unapply refuses to guess without `--force`.
-pub fn plan_unapply<'a>(
+pub(crate) fn plan_unapply<'a>(
     requests: &'a [EditRequest],
     opts: &UnapplyOpts,
 ) -> Result<Vec<UnapplyPlan<'a>>> {
@@ -738,7 +784,7 @@ pub fn plan_unapply<'a>(
 
 /// Ensure template functions or another concurrent actor did not invalidate
 /// any edit ownership checks performed during planning.
-pub fn validate_unapply(todo: &[UnapplyPlan<'_>]) -> Result<()> {
+pub(crate) fn validate_unapply(todo: &[UnapplyPlan<'_>]) -> Result<()> {
     let mut checked = indexmap::IndexSet::new();
     let mut problems = vec![];
     for plan in todo {
@@ -773,7 +819,7 @@ pub fn validate_unapply(todo: &[UnapplyPlan<'_>]) -> Result<()> {
     Ok(())
 }
 
-pub fn execute_unapply(todo: &[UnapplyPlan<'_>], opts: &UnapplyOpts) -> Result<()> {
+pub(crate) fn execute_unapply(todo: &[UnapplyPlan<'_>], opts: &UnapplyOpts) -> Result<()> {
     if todo.is_empty() {
         info!("edits: all edits are unapplied");
         return Ok(());
@@ -874,7 +920,7 @@ fn text_lines(text: &str) -> Vec<TextLine<'_>> {
 /// Simulate applying an edit to in-memory text for bootstrap dry-run config
 /// discovery. Template edits are intentionally not rendered during dry-runs
 /// because rendering may execute user commands.
-pub fn apply_dry_run_to_string(
+pub(crate) fn apply_dry_run_to_string(
     config: &Config,
     req: &EditRequest,
     text: &str,

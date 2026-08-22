@@ -35,7 +35,7 @@ use toml_edit::{Array, InlineTable, Value};
 /// Pass `--all` to import every linked formula, including dependencies.
 #[derive(Debug, clap::Args)]
 #[clap(verbatim_doc_comment, after_long_help = AFTER_LONG_HELP)]
-pub struct SystemImport {
+pub(crate) struct SystemImport {
     /// Write to the config file for this environment (mise.<ENV>.toml)
     #[clap(long, short, value_name = "ENV", conflicts_with_all = ["global", "path"])]
     env: Option<String>,
@@ -68,7 +68,7 @@ pub struct SystemImport {
 }
 
 impl SystemImport {
-    pub async fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         if Settings::get()
             .system_packages
             .managers
@@ -188,7 +188,11 @@ fn imported_package_value(
         Some(PackageTomlConfig::Options(options)) => Some(options),
         Some(PackageTomlConfig::Version(_)) => None,
         None => match configured {
-            Some(PackageTomlConfig::Options(options)) if !options.os.is_empty() => Some(options),
+            Some(PackageTomlConfig::Options(options))
+                if !options.os.is_empty() || options.adopt.is_some() =>
+            {
+                Some(options)
+            }
             _ => None,
         },
     };
@@ -201,6 +205,9 @@ fn imported_package_value(
         let mut os = Array::new();
         os.extend(options.os.clone());
         table.insert("os", Value::Array(os));
+    }
+    if let Some(adopt) = options.adopt {
+        table.insert("adopt", Value::from(adopt));
     }
     Value::InlineTable(table)
 }
@@ -256,10 +263,21 @@ mod tests {
         let inherited = PackageTomlConfig::Options(PackageOptionsTomlConfig {
             version: "1.0.0".to_string(),
             os: vec!["macos".to_string()],
+            adopt: None,
         });
         assert_eq!(
             imported_package_value(None, Some(&inherited)).to_string(),
             r#"{ version = "latest", os = ["macos"] }"#
+        );
+
+        let adopted = PackageTomlConfig::Options(PackageOptionsTomlConfig {
+            version: "1.0.0".to_string(),
+            os: vec![],
+            adopt: Some(true),
+        });
+        assert_eq!(
+            imported_package_value(None, Some(&adopted)).to_string(),
+            r#"{ version = "latest", adopt = true }"#
         );
     }
 }

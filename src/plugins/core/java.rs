@@ -40,7 +40,7 @@ static VERSION_REGEX: Lazy<regex::Regex> = Lazy::new(|| {
 });
 
 #[derive(Debug)]
-pub struct JavaPlugin {
+pub(super) struct JavaPlugin {
     ba: Arc<BackendArg>,
     java_metadata_ea_cache: CacheManager<HashMap<String, JavaMetadata>>,
     java_metadata_ga_cache: CacheManager<HashMap<String, JavaMetadata>>,
@@ -86,7 +86,7 @@ fn is_shorthand_java_request(requested_version: &str) -> bool {
 }
 
 impl JavaPlugin {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         let settings = Settings::get();
         let ba = Arc::new(plugins::core::new_backend_arg("java"));
         Self {
@@ -804,7 +804,18 @@ impl JavaMetadata {
 
 // only care about these features
 static JAVA_FEATURES: Lazy<HashSet<String>> = Lazy::new(|| {
-    HashSet::from(["crac", "javafx", "jcef", "leyden", "lite", "musl"].map(|s| s.to_string()))
+    HashSet::from(
+        [
+            "crac",
+            "innovation",
+            "javafx",
+            "jcef",
+            "leyden",
+            "lite",
+            "musl",
+        ]
+        .map(|s| s.to_string()),
+    )
 });
 
 #[cfg(test)]
@@ -861,6 +872,53 @@ mod tests {
             JavaOptions::new(&opts)
                 .lockfile_options("temurin-17", "temurin")
                 .is_empty()
+        );
+    }
+
+    fn match_versions(versions: &[&str], query: &str) -> Vec<String> {
+        JavaPlugin::new().fuzzy_match_filter(
+            versions.iter().map(|v| v.to_string()).collect(),
+            query,
+            true,
+        )
+    }
+
+    /// A numeric query must not bleed into a longer version: "11.0.1" selects
+    /// "11.0.1" and its build numbers, never "11.0.10".
+    #[test]
+    fn numeric_query_does_not_match_a_longer_version() {
+        let versions = ["11.0.1", "11.0.1+13", "11.0.10", "11.0.10+9"];
+        assert_eq!(
+            match_versions(&versions, "11.0.1"),
+            ["11.0.1".to_string(), "11.0.1+13".to_string()]
+        );
+    }
+
+    /// `mise upgrade --bump` queries with just the vendor prefix, which has to
+    /// match versions whose next character is a digit. See discussion #7328.
+    #[test]
+    fn vendor_prefix_query_matches_versions_starting_with_a_digit() {
+        let versions = ["temurin-25.0.1", "corretto-25.0.1.9.1", "zulu-25.0.1"];
+        assert_eq!(
+            match_versions(&versions, "temurin-"),
+            ["temurin-25.0.1".to_string()]
+        );
+        assert_eq!(
+            match_versions(&versions, "corretto-"),
+            ["corretto-25.0.1.9.1".to_string()]
+        );
+    }
+
+    /// A vendor-qualified major version stays within that major version.
+    #[test]
+    fn vendor_query_with_major_version_keeps_the_major_version() {
+        let versions = ["temurin-21.0.9+11", "temurin-21.0.10+7", "temurin-25.0.1+9"];
+        assert_eq!(
+            match_versions(&versions, "temurin-21"),
+            [
+                "temurin-21.0.9+11".to_string(),
+                "temurin-21.0.10+7".to_string()
+            ]
         );
     }
 }

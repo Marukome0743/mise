@@ -11,7 +11,7 @@ use crate::ui::prompt;
 /// edits require `--force`.
 #[derive(Debug, clap::Args)]
 #[clap(verbatim_doc_comment, after_long_help = AFTER_LONG_HELP)]
-pub struct DotfilesUnapply {
+pub(crate) struct DotfilesUnapply {
     /// Only unapply these targets
     #[clap(value_name = "TARGET")]
     targets: Vec<String>,
@@ -30,9 +30,9 @@ pub struct DotfilesUnapply {
 }
 
 impl DotfilesUnapply {
-    pub async fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         let config = Config::get().await?;
-        let all_files = system::files::files_from_config(&config);
+        let all_files = system::files::files_from_config(&config)?;
         let files = all_files
             .iter()
             .filter(|req| {
@@ -40,7 +40,7 @@ impl DotfilesUnapply {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let all_edits = system::edits::edits_from_config(&config);
+        let all_edits = system::edits::edits_from_config(&config)?;
         let edits = all_edits
             .iter()
             .filter(|req| system::edits::matches_target(req, &self.targets))

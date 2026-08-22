@@ -17,7 +17,7 @@ use std::sync::LazyLock as Lazy;
 use crate::cli::HookReason;
 use crate::config::{Config, DEFAULT_CONFIG_FILENAMES, Settings, config_file};
 use crate::env::PATH_KEY;
-use crate::env_diff::{EnvDiff, EnvDiffOperation, EnvDiffPatches, EnvMap};
+use crate::env_diff::{EnvDiffOperation, EnvDiffPatches, EnvMap};
 use crate::errors::Error;
 use crate::hash::hash_to_str;
 use crate::shell::Shell;
@@ -91,7 +91,7 @@ fn mtime_to_millis(mtime: SystemTime) -> u128 {
         .as_millis()
 }
 
-pub fn untrusted_config_error_path(err: &eyre::Report) -> Option<PathBuf> {
+pub(crate) fn untrusted_config_error_path(err: &eyre::Report) -> Option<PathBuf> {
     err.chain()
         .find_map(|cause| match cause.downcast_ref::<Error>() {
             Some(Error::UntrustedConfig(path)) => Some(path.clone()),
@@ -99,12 +99,15 @@ pub fn untrusted_config_error_path(err: &eyre::Report) -> Option<PathBuf> {
         })
 }
 
-pub fn should_show_untrusted_config_warning(config_path: &Path) -> bool {
+pub(crate) fn should_show_untrusted_config_warning(config_path: &Path) -> bool {
     env::var(LAST_UNTRUSTED_CONFIG_WARNING_KEY_ENV).unwrap_or_default()
         != current_untrusted_warning_key(config_path)
 }
 
-pub fn mark_untrusted_config_warning_seen(shell: &dyn Shell, config_path: &Path) -> Result<()> {
+pub(crate) fn mark_untrusted_config_warning_seen(
+    shell: &dyn Shell,
+    config_path: &Path,
+) -> Result<()> {
     miseprint!(
         "{}",
         shell.set_env(
@@ -115,7 +118,7 @@ pub fn mark_untrusted_config_warning_seen(shell: &dyn Shell, config_path: &Path)
     Ok(())
 }
 
-pub fn clear_untrusted_config_warning(patches: &mut EnvDiffPatches) {
+pub(crate) fn clear_untrusted_config_warning(patches: &mut EnvDiffPatches) {
     if has_untrusted_config_warning_marker() {
         patches.push(EnvDiffOperation::Remove(
             LAST_UNTRUSTED_CONFIG_WARNING_KEY_ENV.into(),
@@ -153,7 +156,7 @@ fn config_path_mtime_millis(path: &Path) -> u128 {
         .unwrap_or_default()
 }
 
-pub static PREV_SESSION: Lazy<HookEnvSession> = Lazy::new(|| {
+pub(crate) static PREV_SESSION: Lazy<HookEnvSession> = Lazy::new(|| {
     env::var("__MISE_SESSION")
         .ok()
         .and_then(|s| {
@@ -168,7 +171,7 @@ pub static PREV_SESSION: Lazy<HookEnvSession> = Lazy::new(|| {
 });
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
-pub struct WatchFilePattern {
+pub(crate) struct WatchFilePattern {
     pub root: Option<PathBuf>,
     pub patterns: Vec<String>,
 }
@@ -194,7 +197,7 @@ impl From<PathBuf> for WatchFilePattern {
 /// Fast-path early exit check that can be called BEFORE loading config/tools.
 /// This checks basic conditions using only the previous session data.
 /// Returns true if we can definitely skip hook-env, false if we need to continue.
-pub fn should_exit_early_fast() -> bool {
+pub(crate) fn should_exit_early_fast() -> bool {
     let args = env::ARGS.read().unwrap();
     if args.len() < 2 || args[1] != "hook-env" {
         return false;
@@ -250,11 +253,6 @@ pub fn should_exit_early_fast() -> bool {
     }
     // Can't exit early if MISE_ env vars changed (cheap in-memory hash comparison)
     if have_mise_env_vars_been_modified() {
-        return false;
-    }
-    // Restore only environment state previously owned by mise. User-added
-    // variables and PATH entries do not affect this check.
-    if has_managed_env_drift(&env::__MISE_DIFF, &current_managed_env(&env::__MISE_DIFF)) {
         return false;
     }
 
@@ -345,7 +343,7 @@ pub fn should_exit_early_fast() -> bool {
 /// Check if hook-env can exit early after config is loaded.
 /// This is called after the fast-path check and handles cases that need
 /// the full config (watch_files, hook scheduling).
-pub fn should_exit_early(
+pub(crate) fn should_exit_early(
     watch_files: impl IntoIterator<Item = WatchFilePattern>,
     reason: Option<HookReason>,
 ) -> bool {
@@ -379,9 +377,6 @@ pub fn should_exit_early(
     if have_mise_env_vars_been_modified() {
         return false;
     }
-    if has_managed_env_drift(&env::__MISE_DIFF, &current_managed_env(&env::__MISE_DIFF)) {
-        return false;
-    }
     // The fast path already decided this run is necessary. Check it only after
     // the slow-path checks above, since they also record modified watch files
     // and schedule hooks as side effects.
@@ -393,7 +388,7 @@ pub fn should_exit_early(
     true
 }
 
-pub fn dir_change() -> Option<(Option<PathBuf>, PathBuf)> {
+pub(crate) fn dir_change() -> Option<(Option<PathBuf>, PathBuf)> {
     match (&PREV_SESSION.dir, &*dirs::CWD) {
         (Some(old), Some(new)) if old != new => {
             trace!("dir change: {:?} -> {:?}", old, new);
@@ -460,51 +455,8 @@ fn have_mise_env_vars_been_modified() -> bool {
     get_mise_env_vars_hashed() != PREV_SESSION.env_var_hash
 }
 
-fn current_managed_env(diff: &EnvDiff) -> EnvMap {
-    let mut current: EnvMap = diff
-        .new
-        .keys()
-        .filter_map(|key| env::var(key).ok().map(|value| (key.clone(), value)))
-        .collect();
-    if !diff.path.is_empty()
-        && let Ok(path) = env::var(&*PATH_KEY)
-    {
-        current.insert(PATH_KEY.to_string(), path);
-    }
-    current
-}
-
-fn has_managed_env_drift(diff: &EnvDiff, current: &EnvMap) -> bool {
-    for (key, expected) in &diff.new {
-        if current.get(key) != Some(expected) {
-            trace!("mise-managed environment variable changed: {key}");
-            return true;
-        }
-    }
-
-    if diff.path.is_empty() {
-        return false;
-    }
-
-    // PATH ownership is set-based: shells such as fish deduplicate entries when
-    // applying the environment, so requiring the serialized occurrence count
-    // would report permanent drift even though the managed path is present.
-    let current_paths = current
-        .get(&*PATH_KEY)
-        .map(|path| env::split_paths(path).collect::<std::collections::HashSet<PathBuf>>())
-        .unwrap_or_default();
-    diff.path.iter().any(|path| {
-        if !current_paths.contains(path) {
-            trace!("mise-managed PATH entry changed: {}", path.display());
-            true
-        } else {
-            false
-        }
-    })
-}
-
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct HookEnvSession {
+pub(crate) struct HookEnvSession {
     pub loaded_tools: IndexSet<String>,
     pub loaded_configs: IndexSet<PathBuf>,
     pub config_paths: IndexSet<PathBuf>,
@@ -524,13 +476,13 @@ pub struct HookEnvSession {
     latest_update: u128,
 }
 
-pub fn serialize<T: serde::Serialize>(obj: &T) -> Result<String> {
+pub(crate) fn serialize<T: serde::Serialize>(obj: &T) -> Result<String> {
     let mut gz = ZlibEncoder::new(Vec::new(), Compression::fast());
     gz.write_all(&rmp_serde::to_vec_named(obj)?)?;
     Ok(BASE64_STANDARD_NO_PAD.encode(gz.finish()?))
 }
 
-pub fn deserialize<T: serde::de::DeserializeOwned>(raw: String) -> Result<T> {
+pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(raw: String) -> Result<T> {
     let mut writer = Vec::new();
     let mut decoder = ZlibDecoder::new(writer);
     let bytes = BASE64_STANDARD_NO_PAD.decode(raw)?;
@@ -567,7 +519,7 @@ fn config_search_dir_mtimes() -> Vec<SystemTime> {
     mtimes
 }
 
-pub async fn build_session(
+pub(crate) async fn build_session(
     config: &Arc<Config>,
     env: EnvMap,
     aliases: indexmap::IndexMap<String, String>,
@@ -629,7 +581,7 @@ pub async fn build_session(
     })
 }
 
-pub fn get_watch_files(
+pub(crate) fn get_watch_files(
     watch_files: impl IntoIterator<Item = WatchFilePattern>,
 ) -> Result<BTreeSet<PathBuf>> {
     let mut watches = BTreeSet::new();
@@ -665,7 +617,7 @@ fn get_mise_env_vars_hashed() -> String {
     hash_to_str(&env_vars)
 }
 
-pub fn clear_old_env(shell: &dyn Shell) -> String {
+pub(crate) fn clear_old_env(shell: &dyn Shell) -> String {
     let mut patches = env::__MISE_DIFF.reverse().to_patches();
 
     // For fish shell, filter out PATH operations from the reversed diff because
@@ -688,7 +640,7 @@ pub fn clear_old_env(shell: &dyn Shell) -> String {
 }
 
 /// Clear all aliases from the previous session. Called only during deactivation.
-pub fn clear_aliases(shell: &dyn Shell) -> String {
+pub(crate) fn clear_aliases(shell: &dyn Shell) -> String {
     let mut output = String::new();
     for name in PREV_SESSION.aliases.keys() {
         output.push_str(&shell.unset_alias(name));
@@ -788,7 +740,7 @@ fn compute_deactivated_path() -> String {
         .unwrap_or(pristine_path)
 }
 
-pub fn build_env_commands(shell: &dyn Shell, patches: &EnvDiffPatches) -> String {
+pub(crate) fn build_env_commands(shell: &dyn Shell, patches: &EnvDiffPatches) -> String {
     let mut output = String::new();
 
     for patch in patches.iter() {
@@ -806,7 +758,7 @@ pub fn build_env_commands(shell: &dyn Shell, patches: &EnvDiffPatches) -> String
 }
 
 /// Build shell alias commands based on the difference between old and new aliases
-pub fn build_alias_commands(
+pub(crate) fn build_alias_commands(
     shell: &dyn Shell,
     old_aliases: &indexmap::IndexMap<String, String>,
     new_aliases: &indexmap::IndexMap<String, String>,
@@ -843,13 +795,7 @@ pub fn build_alias_commands(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FAST_PATH_FORCED_FULL_RUN, force_full_run, has_managed_env_drift, has_preclap_logging_flag,
-    };
-    use crate::env::PATH_KEY;
-    use crate::env_diff::{EnvDiff, EnvMap};
-    use indexmap::indexmap;
-    use std::path::PathBuf;
+    use super::{FAST_PATH_FORCED_FULL_RUN, force_full_run, has_preclap_logging_flag};
     use std::sync::atomic::Ordering;
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -906,65 +852,5 @@ mod tests {
             "hook-env",
             "--verbose"
         ])));
-    }
-
-    fn managed_diff() -> EnvDiff {
-        EnvDiff {
-            new: indexmap! {
-                "MANAGED".into() => "expected".into(),
-            },
-            path: vec![PathBuf::from("/managed/bin"), PathBuf::from("/managed/bin")],
-            ..Default::default()
-        }
-    }
-
-    fn current_env(entries: &[(&str, &str)]) -> EnvMap {
-        entries
-            .iter()
-            .map(|(key, value)| ((*key).into(), (*value).into()))
-            .collect()
-    }
-
-    #[test]
-    fn detects_changed_or_missing_managed_variables() {
-        let diff = managed_diff();
-        let path = std::env::join_paths(["/managed/bin", "/managed/bin"])
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-
-        let changed = current_env(&[("MANAGED", "changed"), (PATH_KEY.as_str(), &path)]);
-        assert!(has_managed_env_drift(&diff, &changed));
-
-        let missing = current_env(&[(PATH_KEY.as_str(), &path)]);
-        assert!(has_managed_env_drift(&diff, &missing));
-    }
-
-    #[test]
-    fn ignores_unmanaged_variables_path_order_and_duplicate_managed_entries() {
-        let diff = managed_diff();
-        let path = std::env::join_paths(["/user/after", "/managed/bin", "/user/before"])
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let current = current_env(&[
-            ("MANAGED", "expected"),
-            ("UNMANAGED", "changed"),
-            (PATH_KEY.as_str(), &path),
-        ]);
-
-        assert!(!has_managed_env_drift(&diff, &current));
-    }
-
-    #[test]
-    fn detects_missing_managed_path() {
-        let diff = managed_diff();
-        let path = std::env::join_paths(["/user/bin"])
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let current = current_env(&[("MANAGED", "expected"), (PATH_KEY.as_str(), &path)]);
-
-        assert!(has_managed_env_drift(&diff, &current));
     }
 }

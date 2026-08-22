@@ -57,39 +57,39 @@ use versions::Versioning;
 
 use self::options::VersionOrder;
 
-pub mod aqua;
-pub mod asdf;
-pub mod asset_matcher;
-pub mod aube_host;
-pub mod backend_type;
-pub mod cargo;
-pub mod conda;
-pub mod dotnet;
+pub(crate) mod aqua;
+pub(crate) mod asdf;
+pub(crate) mod asset_matcher;
+pub(crate) mod aube_host;
+pub(crate) mod backend_type;
+pub(crate) mod cargo;
+pub(crate) mod conda;
+pub(crate) mod dotnet;
 mod external_plugin_cache;
-pub mod gem;
-pub mod github;
-pub mod go;
-pub mod http;
-pub mod jq;
-pub mod npm;
-pub mod npm_registry;
+pub(crate) mod gem;
+pub(crate) mod github;
+pub(crate) mod go;
+pub(crate) mod http;
+pub(crate) mod jq;
+pub(crate) mod npm;
+pub(crate) mod npm_registry;
 pub(crate) mod options;
-pub mod pipx;
-pub mod pkgx;
-pub mod platform_target;
+pub(crate) mod pipx;
+pub(crate) mod pkgx;
+pub(crate) mod platform_target;
 mod platform_tokens;
-pub mod s3;
-pub mod spm;
-pub mod static_helpers;
-pub mod ubi;
-pub mod version_list;
-pub mod vfox;
+pub(crate) mod s3;
+pub(crate) mod spm;
+pub(crate) mod static_helpers;
+pub(crate) mod ubi;
+pub(crate) mod version_list;
+pub(crate) mod vfox;
 
-pub type ABackend = Arc<dyn Backend>;
-pub type BackendMap = BTreeMap<String, ABackend>;
-pub type BackendList = Vec<ABackend>;
-pub type IdiomaticVersion = (String, Option<ToolVersionOptions>);
-pub type VersionCacheManager = CacheManager<Vec<VersionInfo>>;
+pub(crate) type ABackend = Arc<dyn Backend>;
+pub(crate) type BackendMap = BTreeMap<String, ABackend>;
+pub(crate) type BackendList = Vec<ABackend>;
+pub(crate) type IdiomaticVersion = (String, Option<ToolVersionOptions>);
+pub(crate) type VersionCacheManager = CacheManager<Vec<VersionInfo>>;
 
 pub(crate) const MISE_BINS_DIR: &str = ".mise-bins";
 
@@ -114,7 +114,7 @@ static VERSION_LISTING_FAILURES: Lazy<std::sync::Mutex<HashMap<String, String>>>
     Lazy::new(Default::default);
 
 /// Remember that listing remote versions for `ba` failed.
-pub fn record_version_listing_failure(ba: &BackendArg, err: &eyre::Report) {
+pub(crate) fn record_version_listing_failure(ba: &BackendArg, err: &eyre::Report) {
     VERSION_LISTING_FAILURES
         .lock()
         .unwrap()
@@ -122,7 +122,7 @@ pub fn record_version_listing_failure(ba: &BackendArg, err: &eyre::Report) {
 }
 
 /// The cause of the failed remote version listing for `ba`, if one was recorded.
-pub fn version_listing_failure(ba: &BackendArg) -> Option<String> {
+pub(crate) fn version_listing_failure(ba: &BackendArg) -> Option<String> {
     VERSION_LISTING_FAILURES
         .lock()
         .unwrap()
@@ -219,6 +219,25 @@ fn has_local_version_listing_option_override(
     resolved_opts
         .has_any_key_from_sources(version_listing_opt_keys, VERSIONS_HOST_LOCAL_OPT_SOURCES)
 }
+
+/// Digest of the listing-relevant tool options, used to partition the remote-version cache.
+///
+/// The cached list is *shaped* by these options — `version_prefix` decides which tags survive
+/// and how they are spelled, `api_url` decides which host answered — so two different sets of
+/// values must not share a cache entry. Collected into a `BTreeMap` so the digest depends on
+/// the values rather than on the order the options were inserted, the same way asdf's
+/// `version_listing_cache_context` does.
+///
+/// `get_string` rather than `get`: the latter yields `None` for any non-string TOML scalar,
+/// which would quietly collapse two distinct values into one key.
+fn listing_option_digest(opts: &ToolVersionOptions, version_listing_opt_keys: &[&str]) -> String {
+    let values: BTreeMap<&str, String> = version_listing_opt_keys
+        .iter()
+        .filter_map(|key| opts.get_string(key).map(|value| (*key, value)))
+        .collect();
+    hash::hash_to_str(&values)
+}
+
 /// Remaps a backend-discovered path from the concrete install dir to the
 /// runtime path users put on PATH.
 ///
@@ -255,24 +274,24 @@ pub(crate) fn runtime_path_for_install_path(tv: &ToolVersion, path: PathBuf) -> 
 
 static STRICT_METADATA: AtomicBool = AtomicBool::new(false);
 
-pub fn set_strict_metadata(strict: bool) {
+pub(crate) fn set_strict_metadata(strict: bool) {
     STRICT_METADATA.store(strict, Ordering::Relaxed);
 }
 
-pub fn strict_metadata() -> bool {
+pub(crate) fn strict_metadata() -> bool {
     STRICT_METADATA.load(Ordering::Relaxed)
 }
 
 /// Information about a GitHub/GitLab release for platform-specific tools
 #[derive(Debug, Clone)]
-pub struct GitHubReleaseInfo {
+pub(crate) struct GitHubReleaseInfo {
     pub asset_pattern: Option<String>,
     pub api_url: Option<String>,
 }
 
 /// Information about a tool version including optional metadata like creation time
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct VersionInfo {
+pub(crate) struct VersionInfo {
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
@@ -299,7 +318,7 @@ fn is_false(v: &bool) -> bool {
 }
 
 impl VersionInfo {
-    pub fn created_at_timestamp(&self) -> Option<Timestamp> {
+    pub(crate) fn created_at_timestamp(&self) -> Option<Timestamp> {
         match &self.created_at {
             Some(ts) => {
                 let created = parse_into_timestamp(ts);
@@ -312,18 +331,18 @@ impl VersionInfo {
         }
     }
 
-    pub fn hidden_by_date(&self, before: Timestamp) -> bool {
+    pub(crate) fn hidden_by_date(&self, before: Timestamp) -> bool {
         self.created_at_timestamp()
             .is_some_and(|created| created >= before)
     }
 
-    pub fn count_hidden_by_date(versions: &[Self], before: Timestamp) -> usize {
+    pub(crate) fn count_hidden_by_date(versions: &[Self], before: Timestamp) -> usize {
         versions.iter().filter(|v| v.hidden_by_date(before)).count()
     }
 
     /// Filter versions to only include those released before the given timestamp.
     /// Versions without a created_at timestamp are included by default.
-    pub fn filter_by_date(versions: Vec<Self>, before: Timestamp) -> Vec<Self> {
+    pub(crate) fn filter_by_date(versions: Vec<Self>, before: Timestamp) -> Vec<Self> {
         versions
             .into_iter()
             .filter(|v| {
@@ -337,7 +356,7 @@ impl VersionInfo {
 /// Security feature information for a tool
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum SecurityFeature {
+pub(crate) enum SecurityFeature {
     Checksum {
         #[serde(skip_serializing_if = "Option::is_none")]
         algorithm: Option<String>,
@@ -359,8 +378,19 @@ pub enum SecurityFeature {
 }
 
 static TOOLS: Mutex<Option<Arc<BackendMap>>> = Mutex::new(None);
+/// Whether TOOLS has been extended with every installed tool. Enumerating the
+/// installs dir costs a readdir per tool plus stats per version, so it only
+/// happens when a caller genuinely needs the full list ([`list`]).
+static TOOLS_INCLUDE_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// The map [`load_tools`] seeded (core tools and registry entries with idiomatic
+/// files). An installed tool takes precedence over these — it carries the
+/// recorded install identity — but must not displace an entry [`get`] resolved
+/// later, which may carry command-scoped options. Held as the seed map itself so
+/// recording it costs one Arc clone rather than a copy of every short.
+static TOOLS_SEEDED: Mutex<Option<Arc<BackendMap>>> = Mutex::new(None);
 
-pub async fn load_tools() -> Result<Arc<BackendMap>> {
+pub(crate) async fn load_tools() -> Result<Arc<BackendMap>> {
     if let Some(memo_tools) = TOOLS.lock().unwrap().clone() {
         return Ok(memo_tools);
     }
@@ -376,13 +406,6 @@ pub async fn load_tools() -> Result<Arc<BackendMap>> {
             .filter_map(|rt| arg_to_backend(rt.short.into())),
     );
     time!("load_tools core");
-    tools.extend(
-        install_state::list_tools()
-            .values()
-            .filter(|ist| ist.full.is_some())
-            .flat_map(|ist| arg_to_backend(ist.clone().into())),
-    );
-    time!("load_tools install_state");
     let settings = Settings::get();
     let enable_tools = settings.enable_tools();
     let disable_tools = settings.disable_tools();
@@ -400,12 +423,79 @@ pub async fn load_tools() -> Result<Arc<BackendMap>> {
         .map(|backend| (backend.ba().short.clone(), backend))
         .collect();
     let tools = Arc::new(tools);
-    *TOOLS.lock().unwrap() = Some(tools.clone());
+    // Two tasks can race past the memo check above and both build seed maps.
+    // Committing unconditionally would let the loser replace a map list() may
+    // already have extended with installed tools — and TOOLS_INCLUDE_INSTALLED
+    // stays set, so those entries would never be restored. First publisher
+    // wins; everyone else adopts the published map.
+    {
+        let mut cached = TOOLS.lock().unwrap();
+        if let Some(existing) = cached.as_ref() {
+            return Ok(existing.clone());
+        }
+        *TOOLS_SEEDED.lock().unwrap() = Some(tools.clone());
+        *cached = Some(tools.clone());
+    }
     time!("load_tools done");
     Ok(tools)
 }
 
-pub fn list() -> BackendList {
+/// Whether an installed tool should displace the TOOLS entry for `short`.
+///
+/// `load_tools` collected core tools, then registry entries with idiomatic
+/// files, then installed tools into one map — so an installed tool sharing a
+/// short with a core/registry entry won, keeping its recorded install identity
+/// (e.g. an asdf/vfox `node` install over core node). Now that installed tools
+/// are added later, preserve that precedence over seeds while leaving entries
+/// [`get`] resolved afterwards alone: those can carry command-scoped options.
+fn installed_replaces<V>(seeded: &BTreeMap<String, V>, short: &str) -> bool {
+    seeded.contains_key(short)
+}
+
+/// Extend TOOLS with a backend for every installed tool. Installed tools are
+/// otherwise loaded one at a time through [`get`]; enumerating callers need
+/// them all, which means a full installs-dir scan.
+fn ensure_installed_tools_loaded() {
+    let mut tools = TOOLS.lock().unwrap();
+    if TOOLS_INCLUDE_INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Some(current) = tools.as_ref() else {
+        // load_tools has not run; the flag stays set and list() callers go
+        // through load_tools first, which ends up here again.
+        TOOLS_INCLUDE_INSTALLED.store(false, std::sync::atomic::Ordering::SeqCst);
+        return;
+    };
+    let settings = Settings::get();
+    let enable_tools = settings.enable_tools();
+    let disable_tools = settings.disable_tools();
+    let seeded = TOOLS_SEEDED.lock().unwrap().clone().unwrap_or_default();
+    let mut next = current.deref().clone();
+    for backend in install_state::list_tools()
+        .values()
+        .filter(|ist| ist.full.is_some())
+        .flat_map(|ist| arg_to_backend(ist.clone().into()))
+    {
+        if !tool_enabled(
+            enable_tools.as_ref(),
+            &disable_tools,
+            &backend.id().to_string(),
+        ) || is_disabled_backend_type(&backend.get_type())
+        {
+            continue;
+        }
+        let short = backend.ba().short.clone();
+        if installed_replaces(&seeded, &short) {
+            next.insert(short, backend);
+        } else {
+            next.entry(short).or_insert(backend);
+        }
+    }
+    *tools = Some(Arc::new(next));
+}
+
+pub(crate) fn list() -> BackendList {
+    ensure_installed_tools_loaded();
     TOOLS
         .lock()
         .unwrap()
@@ -416,7 +506,42 @@ pub fn list() -> BackendList {
         .collect()
 }
 
-pub fn get(ba: &BackendArg) -> Option<ABackend> {
+/// Backends that can contribute version aliases.
+///
+/// Only core tools and asdf/vfox plugins override `get_aliases`; every other
+/// backend returns the default empty map. Config loading calls this on every
+/// invocation, so enumerating all installed tools here would put the full
+/// installs-dir scan back on the hot path for entries that contribute nothing.
+pub(crate) fn alias_backends() -> BackendList {
+    // Reuse what load_tools already built rather than constructing backends:
+    // building one is not cheap (registry lookup, path derivation), and this
+    // runs during every config load. Core tools are already seeded there, so
+    // only plugin-backed shorts that are absent need constructing.
+    let seeded = TOOLS.lock().unwrap().clone().unwrap_or_default();
+    let settings = Settings::get();
+    let enable_tools = settings.enable_tools();
+    let disable_tools = settings.disable_tools();
+    seeded
+        .values()
+        .cloned()
+        .chain(
+            install_state::try_list_plugins()
+                .unwrap_or_default()
+                .keys()
+                .filter(|short| !seeded.contains_key(*short))
+                .filter_map(|short| arg_to_backend(short.as_str().into())),
+        )
+        .filter(|backend| {
+            tool_enabled(
+                enable_tools.as_ref(),
+                &disable_tools,
+                &backend.id().to_string(),
+            ) && !is_disabled_backend_type(&backend.get_type())
+        })
+        .collect()
+}
+
+pub(crate) fn get(ba: &BackendArg) -> Option<ABackend> {
     // Inline opts are command-scoped, so a short-name cache hit must not drop
     // the caller's BackendArg options.
     if (ba.explicit_opts().is_some() || ba.has_explicit_backend())
@@ -439,7 +564,7 @@ pub fn get(ba: &BackendArg) -> Option<ABackend> {
     }
 }
 
-pub fn remove(short: &str) {
+pub(crate) fn remove(short: &str) {
     let mut tools = TOOLS.lock().unwrap();
     if let Some(current) = tools.as_ref() {
         let mut tools_ = current.deref().clone();
@@ -448,13 +573,13 @@ pub fn remove(short: &str) {
     }
 }
 
-pub fn is_disabled_backend_type(backend_type: &BackendType) -> bool {
+pub(crate) fn is_disabled_backend_type(backend_type: &BackendType) -> bool {
     backend_type
         .disable_key()
         .is_some_and(is_disabled_backend_name)
 }
 
-pub fn ensure_backend_enabled(backend_type: &BackendType) -> Result<()> {
+pub(crate) fn ensure_backend_enabled(backend_type: &BackendType) -> Result<()> {
     if is_disabled_backend_type(backend_type) {
         bail!("backend {backend_type} is disabled by disable_backends");
     }
@@ -468,7 +593,7 @@ fn is_disabled_backend_name(backend: &str) -> bool {
         .any(|disabled| disabled == backend)
 }
 
-pub fn arg_to_backend(ba: BackendArg) -> Option<ABackend> {
+pub(crate) fn arg_to_backend(ba: BackendArg) -> Option<ABackend> {
     match ba.backend_type() {
         BackendType::Core => {
             CORE_PLUGINS
@@ -512,7 +637,7 @@ pub fn arg_to_backend(ba: BackendArg) -> Option<ABackend> {
 /// Most keys affect installation/download identity, but backend-specific lists may also
 /// include layout options that are stored in the install manifest and should not be
 /// reused from stale cached options when config provides its own options.
-pub fn install_time_option_keys_for_type(backend_type: &BackendType) -> Vec<String> {
+pub(crate) fn install_time_option_keys_for_type(backend_type: &BackendType) -> Vec<String> {
     match backend_type {
         BackendType::Http => http::install_time_option_keys(),
         BackendType::S3 => s3::install_time_option_keys(),
@@ -532,7 +657,7 @@ pub fn install_time_option_keys_for_type(backend_type: &BackendType) -> Vec<Stri
 }
 
 /// Returns true if a backend option's cached value should be replaced by current config.
-pub fn is_install_time_option_key_for_type(backend_type: &BackendType, key: &str) -> bool {
+pub(crate) fn is_install_time_option_key_for_type(backend_type: &BackendType, key: &str) -> bool {
     if matches!(backend_type, BackendType::Aqua) {
         return aqua::is_install_time_option_key(key);
     }
@@ -611,50 +736,43 @@ fn parse_matching_registry_idiomatic_file(
         .max_by_key(|spec| Path::new(spec.path).components().count())
         .filter(|spec| spec.has_parser())
     {
-        Some(spec) => parse_registry_idiomatic_file(path, spec),
+        Some(spec) => match spec.deprecated {
+            // The file's only parser reads a value mise should not be installing from.
+            // Opting in early means it yields nothing -- `Some(vec![])` rather than
+            // `None`, so the backend's plain-text fallback doesn't read the whole file.
+            Some(_) if Settings::get().idiomatic_version_file_ignore_minimum_versions => {
+                Ok(Some(vec![]))
+            }
+            Some(reason) => {
+                let versions = parse_registry_idiomatic_file(path, spec)?;
+                // Only warn when the file actually resolved something, so a project
+                // that merely has the file lying around stays quiet.
+                if versions
+                    .as_ref()
+                    .is_some_and(|versions| !versions.is_empty())
+                {
+                    // The path is the id so two deprecated files can't silence each
+                    // other, and it already names the file in the warning.
+                    let id = spec.path;
+                    deprecated_at!(
+                        "2026.8.10",
+                        "2026.11.0",
+                        id,
+                        "{reason} mise will stop reading it as an idiomatic version file; set the version in mise.toml instead."
+                    );
+                }
+                Ok(versions)
+            }
+            None => parse_registry_idiomatic_file(path, spec),
+        },
         None => Ok(None),
     }
 }
 
-fn executable_names(bin: &str) -> Vec<String> {
-    let mut names = vec![bin.to_string()];
-    if cfg!(target_os = "windows") && Path::new(bin).extension().is_none() {
-        for ext in &Settings::get().windows_executable_extensions {
-            let name = if ext.is_empty() {
-                bin.to_string()
-            } else {
-                format!("{bin}.{ext}")
-            };
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-    }
-    names
-}
-
 fn which_non_pristine_executable(bin: &str) -> Option<PathBuf> {
-    executable_names(bin)
+    file::executable_names(bin)
         .into_iter()
         .find_map(file::which_non_pristine)
-}
-
-/// True when the OS will accept `path` as the program argument of a spawn.
-///
-/// [`file::can_execute_directly`] is *pure extension inspection* on Windows — it never
-/// touches the filesystem, so it answers true for a `foo.exe` that is not there. The
-/// `is_file()` guard supplies the existence check that [`file::is_executable`] performs
-/// inline; without it a lookup built on this would hand back paths to missing files.
-///
-/// The guard is `cfg!(windows)`-gated deliberately. On unix `can_execute_directly`
-/// delegates to `is_executable`, which stats already — and which answers true for a
-/// mode-0755 *directory*. Adding `is_file()` unconditionally would silently narrow every
-/// unix lookup below it, so unix keeps today's answer exactly.
-fn is_spawnable(path: &Path) -> bool {
-    if cfg!(windows) && !path.is_file() {
-        return false;
-    }
-    file::can_execute_directly(path)
 }
 
 /// Resolve `bin` inside `dirs`, in the order the OS itself resolves: directory-major,
@@ -670,7 +788,7 @@ fn is_spawnable(path: &Path) -> bool {
 ///   searching **past** a candidate it rejects, so `None` means "nothing spawnable
 ///   exists" rather than "the first thing I looked at was not spawnable".
 ///
-/// Directory-major only matters on Windows, where [`executable_names`] yields several
+/// Directory-major only matters on Windows, where [`file::executable_names`] yields several
 /// candidates per directory. It is the order `CreateProcess`+`PATHEXT`, `cmd.exe` and the
 /// `which` crate all use, and the order [`Backend::which`] has always used. It diverges
 /// from [`which_non_pristine_executable`], which is *name-major* — the bare name is tried
@@ -678,17 +796,17 @@ fn is_spawnable(path: &Path) -> bool {
 /// directory-major resolves the case this exists for: mise's own node install ships a
 /// shebang `npm` and an `npm.cmd` side by side in one directory, with no `npm.exe`.
 ///
-/// On unix `executable_names` returns exactly one name, so both orders are the same
+/// On unix `file::executable_names` returns exactly one name, so both orders are the same
 /// traversal and this degenerates to `file::_which` with a different predicate.
 fn which_in_dirs<I>(dirs: I, bin: &str, spawnable: bool) -> Option<PathBuf>
 where
     I: IntoIterator<Item = PathBuf>,
 {
-    let names = executable_names(bin);
+    let names = file::executable_names(bin);
     dirs.into_iter().find_map(|dir| {
         names.iter().map(|name| dir.join(name)).find(|candidate| {
             if spawnable {
-                is_spawnable(candidate)
+                file::is_spawnable(candidate)
             } else {
                 candidate.exists() && file::is_executable(candidate)
             }
@@ -727,6 +845,14 @@ fn which_non_pristine_spawnable(bin: &str) -> Option<PathBuf> {
     which_in_dirs(dirs, bin, true)
 }
 
+pub(crate) fn which_no_shims_spawnable(bin: &str) -> Option<PathBuf> {
+    let dirs = env::PATH_NON_PRISTINE
+        .iter()
+        .filter(|p| !file::is_mise_shims_dir(p))
+        .cloned();
+    which_in_dirs(dirs, bin, true)
+}
+
 pub(crate) async fn configured_toolset_or_path_which(
     config: &Arc<Config>,
     tools: impl IntoIterator<Item = String>,
@@ -754,6 +880,17 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn test_installed_replaces_seed_but_not_later_entry() {
+        // Only key presence matters, so this stands in for the seeded BackendMap.
+        let seeded: BTreeMap<String, ()> = [("node".to_string(), ())].into_iter().collect();
+        // A core/registry seed yields to the installed tool's recorded identity.
+        assert!(installed_replaces(&seeded, "node"));
+        // An entry `get` resolved after load_tools may carry command-scoped
+        // options, so it is left alone.
+        assert!(!installed_replaces(&seeded, "mytool"));
+    }
 
     fn create_test_backend_arg(tool: &str) -> Arc<BackendArg> {
         Arc::new(BackendArg::new_raw(
@@ -908,7 +1045,7 @@ mod tests {
         for name in ["a.ps1", "b.PS1", "c.vbs", "d.VBS"] {
             let path = dir.path().join(name);
             fs::write(&path, "exit 0\n").unwrap();
-            assert!(!is_spawnable(&path), "{name} must not be spawnable");
+            assert!(!file::is_spawnable(&path), "{name} must not be spawnable");
             assert!(
                 file::is_executable(&path),
                 "{name} should still satisfy the permissive predicate"
@@ -954,10 +1091,10 @@ mod tests {
         let subdir = dir.path().join("subdir");
         fs::create_dir(&subdir).unwrap();
 
-        assert!(is_spawnable(&tool));
-        assert!(!is_spawnable(&plain));
+        assert!(file::is_spawnable(&tool));
+        assert!(!file::is_spawnable(&plain));
         assert_eq!(
-            is_spawnable(&subdir),
+            file::is_spawnable(&subdir),
             file::is_executable(&subdir),
             "a mode-0755 directory must be answered the same either way"
         );
@@ -982,6 +1119,7 @@ mod tests {
             version_regex: None,
             version_json_path: Some(".releases[?channel=stable].version"),
             version_expr: None,
+            deprecated: None,
         };
 
         assert_eq!(
@@ -1001,6 +1139,7 @@ mod tests {
             version_regex: None,
             version_json_path: Some(".version"),
             version_expr: None,
+            deprecated: None,
         }];
 
         assert_eq!(
@@ -1019,6 +1158,7 @@ mod tests {
             version_regex: None,
             version_json_path: Some(".tool.version"),
             version_expr: None,
+            deprecated: None,
         }];
 
         assert_eq!(
@@ -1034,6 +1174,7 @@ mod tests {
             version_regex: None,
             version_json_path: None,
             version_expr: None,
+            deprecated: None,
         };
 
         assert_eq!(
@@ -1186,6 +1327,76 @@ mod tests {
             &resolved,
             &["api_url", "version_prefix"],
         ));
+    }
+
+    /// The digest keys a cache, so it has to depend on the values and not on the order the
+    /// options happened to be inserted in — `opts` is insertion-ordered.
+    #[test]
+    fn test_listing_option_digest_is_stable_and_order_independent() {
+        use crate::toolset::ToolVersionOptions;
+
+        let keys = &["api_url", "version_prefix"];
+        let api_url = || toml::Value::String("https://github.example.com/api/v3".into());
+        let prefix = || toml::Value::String("release-".into());
+
+        let mut forward = ToolVersionOptions::default();
+        forward.opts.insert("api_url".to_string(), api_url());
+        forward.opts.insert("version_prefix".to_string(), prefix());
+
+        let mut reverse = ToolVersionOptions::default();
+        reverse.opts.insert("version_prefix".to_string(), prefix());
+        reverse.opts.insert("api_url".to_string(), api_url());
+
+        assert_eq!(
+            listing_option_digest(&forward, keys),
+            listing_option_digest(&reverse, keys),
+        );
+        assert_eq!(
+            listing_option_digest(&forward, keys),
+            listing_option_digest(&forward, keys),
+        );
+    }
+
+    /// Every distinction the version listing depends on has to reach the digest, and nothing
+    /// else may: an install-time option that cannot change the list must not split the cache.
+    #[test]
+    fn test_listing_option_digest_tracks_declared_keys_only() {
+        use crate::toolset::ToolVersionOptions;
+
+        let keys = &["api_url", "version_prefix"];
+        let empty = ToolVersionOptions::default();
+
+        let mut prefix_a = ToolVersionOptions::default();
+        prefix_a.opts.insert(
+            "version_prefix".to_string(),
+            toml::Value::String("a-".into()),
+        );
+
+        let mut prefix_b = ToolVersionOptions::default();
+        prefix_b.opts.insert(
+            "version_prefix".to_string(),
+            toml::Value::String("b-".into()),
+        );
+
+        // The defect this guards: two prefixes that produce different listings sharing an entry.
+        assert_ne!(
+            listing_option_digest(&prefix_a, keys),
+            listing_option_digest(&prefix_b, keys),
+        );
+        assert_ne!(
+            listing_option_digest(&empty, keys),
+            listing_option_digest(&prefix_a, keys),
+        );
+
+        let mut with_install_opt = prefix_a.clone();
+        with_install_opt.opts.insert(
+            "asset_pattern".to_string(),
+            toml::Value::String("tool-{{version}}.tar.gz".into()),
+        );
+        assert_eq!(
+            listing_option_digest(&prefix_a, keys),
+            listing_option_digest(&with_install_opt, keys),
+        );
     }
 
     #[test]
@@ -1476,6 +1687,36 @@ mod tests {
     }
 
     #[test]
+    fn test_fuzzy_match_versions_flavour_query_does_not_cross_a_plus() {
+        // "truffleruby" and "truffleruby+graalvm" are distinct flavours, so a
+        // bare flavour name must not select the other one.
+        let versions = ["truffleruby-34.0.1", "truffleruby+graalvm-34.0.1"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            fuzzy_match_versions(versions.clone(), "truffleruby", true),
+            ["truffleruby-34.0.1".to_string()]
+        );
+        assert_eq!(
+            fuzzy_match_versions(versions, "truffleruby+graalvm", true),
+            ["truffleruby+graalvm-34.0.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_match_versions_numeric_query_still_matches_build_metadata() {
+        // `+` remains a separator for numeric queries, where it introduces
+        // semver build metadata rather than a different flavour.
+        let versions = ["1.9.1", "v1.9.1+hotfix.2", "1.9.10"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            fuzzy_match_versions(versions, "1.9.1", true),
+            ["1.9.1".to_string(), "v1.9.1+hotfix.2".to_string()]
+        );
+    }
+
+    #[test]
     fn test_fuzzy_match_versions_pep440_drops_alphas_but_honors_exact_match() {
         let versions = vec![
             "3.13.0".to_string(),
@@ -1714,7 +1955,7 @@ mod tests {
 }
 
 #[async_trait]
-pub trait Backend: Debug + Send + Sync {
+pub(crate) trait Backend: Debug + Send + Sync {
     fn id(&self) -> &str {
         &self.ba().short
     }
@@ -1934,6 +2175,8 @@ pub trait Backend: Debug + Send + Sync {
     ///
     /// In offline mode, this reads the existing remote-versions cache without
     /// fetching or writing. If no cache exists, it returns an empty list.
+    /// The returned list applies the backend's configured `version_order`; the
+    /// cached value remains in source order.
     async fn list_remote_versions_with_info(
         &self,
         config: &Arc<Config>,
@@ -1953,14 +2196,19 @@ pub trait Backend: Debug + Send + Sync {
             &resolved_opts,
             self.remote_version_listing_tool_option_keys(),
         );
-        self.list_remote_versions_with_info_and_options(
-            config,
-            resolved_opts.options(),
-            resolved_opts.options(),
-            refresh,
-            has_local_version_listing_override,
-        )
-        .await
+        let opts = resolved_opts.options();
+        let versions = self
+            .list_remote_versions_with_info_and_options(
+                config,
+                opts,
+                opts,
+                refresh,
+                has_local_version_listing_override,
+            )
+            .await?;
+        Ok(self
+            .version_order(opts)?
+            .order_by(versions, |version| version.version.as_str()))
     }
 
     /// List remote versions while selecting candidates with the active request's options.
@@ -1978,14 +2226,18 @@ pub trait Backend: Debug + Send + Sync {
             &resolved_opts,
             self.remote_version_listing_tool_option_keys(),
         );
-        self.list_remote_versions_with_info_and_options(
-            config,
-            resolved_opts.options(),
-            opts,
-            refresh,
-            has_local_version_listing_override,
-        )
-        .await
+        let versions = self
+            .list_remote_versions_with_info_and_options(
+                config,
+                resolved_opts.options(),
+                opts,
+                refresh,
+                has_local_version_listing_override,
+            )
+            .await?;
+        Ok(self
+            .version_order(opts)?
+            .order_by(versions, |version| version.version.as_str()))
     }
 
     /// Common remote-version listing hook for both config- and request-aware callers.
@@ -1998,7 +2250,23 @@ pub trait Backend: Debug + Send + Sync {
         refresh: bool,
         has_local_version_listing_override: bool,
     ) -> eyre::Result<Vec<VersionInfo>> {
-        let cache_context = self.remote_version_cache_context(config).await?;
+        // The listing-relevant options shape the cached list, so they belong in its key.
+        // Only local overrides count: a registry-supplied value is identical for everyone, so
+        // one entry is correct for it, and leaving it out keeps the shared versions host
+        // available for the default case.
+        let opt_context = has_local_version_listing_override.then(|| {
+            listing_option_digest(listing_opts, self.remote_version_listing_tool_option_keys())
+        });
+        let cache_context = match (
+            self.remote_version_cache_context(config).await?,
+            opt_context,
+        ) {
+            (Some(backend_context), Some(opt_context)) => {
+                Some(hash::hash_to_str(&(backend_context, opt_context)))
+            }
+            (Some(context), None) | (None, Some(context)) => Some(context),
+            (None, None) => None,
+        };
         let remote_versions = match cache_context.as_deref() {
             Some(context) => self.get_remote_version_cache_with_context(Some(context)),
             None => self.get_remote_version_cache(),
@@ -2042,15 +2310,17 @@ pub trait Backend: Debug + Send + Sync {
                 ba.short, backend_type
             );
             false
-        } else if cache_context.is_some() {
+        } else if has_local_version_listing_override {
+            // Checked before the context: an option override now also produces a cache
+            // context, and this is the message that names the actual cause.
             trace!(
-                "Skipping versions host for {} because local context affects remote version listing",
+                "Skipping versions host for {} because local backend opts affect remote version listing",
                 ba.short,
             );
             false
-        } else if has_local_version_listing_override {
+        } else if cache_context.is_some() {
             trace!(
-                "Skipping versions host for {} because local backend opts affect remote version listing",
+                "Skipping versions host for {} because local context affects remote version listing",
                 ba.short,
             );
             false
@@ -2435,22 +2705,6 @@ pub trait Backend: Debug + Send + Sync {
             }
         }
         None
-    }
-    fn create_symlink(&self, version: &str, target: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
-        let _state_lock = install_state::lock_tool_version(&self.ba().short, version)?;
-        let link = self.ba().installs_path.join(version);
-        if link.exists() {
-            if target.exists() && file::is_symlink_to(&link, target) {
-                install_state::clear_incomplete_marker(&self.ba().short, version)?;
-            }
-            return Ok(None);
-        }
-        file::create_dir_all(link.parent().unwrap())?;
-        let link = file::make_symlink(target, &link)?;
-        if target.exists() {
-            install_state::clear_incomplete_marker(&self.ba().short, version)?;
-        }
-        Ok(Some(link))
     }
     fn list_installed_versions_matching(&self, query: &str) -> Vec<String> {
         let versions = self.list_installed_versions();
@@ -2887,10 +3141,10 @@ pub trait Backend: Debug + Send + Sync {
                 .collect()
         } else if crate::config::config_file::idiomatic_version::package_json::is_package_json(path)
         {
-            crate::config::config_file::idiomatic_version::package_json::parse(path, self.id())?
-                .into_iter()
-                .map(|version| (version, None))
-                .collect()
+            crate::config::config_file::idiomatic_version::package_json::parse_with_options(
+                path,
+                self.id(),
+            )?
         } else {
             self._parse_idiomatic_file_with_options(path).await?
         };
@@ -2949,6 +3203,10 @@ pub trait Backend: Debug + Send + Sync {
         ctx: InstallContext,
         mut tv: ToolVersion,
     ) -> eyre::Result<ToolVersion> {
+        // Toolset installs preflight these options before doing any work, but
+        // direct callers such as `install-into` must be protected here too.
+        tv.request.ensure_safe_install_options()?;
+
         // Check for --locked mode: if enabled and no lockfile URL exists, fail early
         // Exempt tool stubs from lockfile requirements since they are ephemeral
         // Also exempt backends that don't support URL locking (e.g., Rust uses rustup)
@@ -3139,7 +3397,7 @@ pub trait Backend: Debug + Send + Sync {
         // "{{ tools.python.path }}/bin/python3"`) for the tool-level `postinstall`
         // hook, resolved against this tool's already-installed dependencies. The
         // config env added above is resolved without tools (`NonToolsOnly`), so it
-        // omits these; `install_dependency_toolset` is fully resolved (offline) so
+        // omits these; `install_dependency_context` is fully resolved (offline) so
         // `{{ tools.<dep>.path }}` maps to a real install path — `ctx.ts` is the raw,
         // unresolved install toolset during a combined install. PATH stays owned by
         // `path_env` below. Best-effort: any resolution error leaves the tool-less
@@ -3164,11 +3422,8 @@ pub trait Backend: Debug + Send + Sync {
                 .is_some_and(|deps| !deps.is_empty());
         if declares_deps {
             let base = env_vars.clone();
-            let tool_vals = match self
-                .install_dependency_toolset(&ctx.config, &tv_exact)
-                .await
-            {
-                Ok(dep_ts) => dep_ts.tool_val_env(&ctx.config, &base).await,
+            let tool_vals = match self.install_dependency_context(ctx, &tv_exact).await {
+                Ok(dependencies) => dependencies.toolset.tool_val_env(&ctx.config, &base).await,
                 Err(e) => Err(e),
             };
             match tool_vals {
@@ -3488,47 +3743,12 @@ pub trait Backend: Debug + Send + Sync {
         Ok(ts)
     }
 
-    /// Like [`Self::dependency_toolset`] but also includes this tool's per-instance
-    /// mise.toml `depends` option (`tv.request.options().depends`). `get_dependencies`
-    /// only covers backend/plugin-metadata deps, so a user-declared
-    /// `gcloud = { depends = ["python"] }` is invisible to `dependency_toolset`.
-    /// Used anywhere an install needs the concrete paths or values of its declared
-    /// dependencies, including `tools = true` `[env]` value templates and asdf
-    /// install scripts. Resolved offline; the declared deps are installed before the
-    /// dependent (depends ordering), so their install paths are present. (#10282,
-    /// #4384)
-    async fn install_dependency_toolset(
+    async fn install_dependency_context<'a>(
         &self,
-        config: &Arc<Config>,
+        ctx: &'a InstallContext,
         tv: &ToolVersion,
-    ) -> eyre::Result<Toolset> {
-        let mut names: std::collections::HashSet<String> = self
-            .get_all_dependencies(true)?
-            .into_iter()
-            .map(|ba| ba.short)
-            .collect();
-        let opts = tv.request.options();
-        if let Some(user_deps) = opts.core.depends {
-            names.extend(
-                user_deps
-                    .into_iter()
-                    .flat_map(|dep| BackendArg::from(dep).all_fulls()),
-            );
-        }
-        let mut ts: Toolset = config
-            .get_tool_request_set()
-            .await?
-            .filter_by_tool(names)
-            .into();
-        ts.resolve_with_opts(
-            config,
-            &ResolveOptions {
-                offline: true,
-                ..Default::default()
-            },
-        )
-        .await?;
-        Ok(ts)
+    ) -> eyre::Result<&'a crate::install_context::InstallDependencyContext> {
+        ctx.dependency_context(&tv.request).await
     }
 
     async fn dependency_which(&self, config: &Arc<Config>, bin: &str) -> Option<PathBuf> {
@@ -3733,8 +3953,9 @@ pub trait Backend: Debug + Send + Sync {
 
     /// Select the ordering policy supported by this backend.
     ///
-    /// Backends must opt in explicitly before `version_order` can affect
-    /// resolution. This keeps opaque version schemes source-ordered by default.
+    /// Backends must opt in explicitly before `version_order` can affect remote
+    /// version listing or resolution. This keeps opaque version schemes
+    /// source-ordered by default.
     fn version_order(&self, opts: &ToolVersionOptions) -> eyre::Result<VersionOrder> {
         if opts.opts.contains_key("version_order") {
             bail!("{} backend does not support version_order", self.get_type())
@@ -4071,6 +4292,7 @@ mod latest_version_tests {
         stable_result: Option<String>,
         stable_info: Option<VersionInfo>,
         remote_versions: Vec<VersionInfo>,
+        listing_keys: &'static [&'static str],
         stable_calls: AtomicUsize,
         stable_info_calls: AtomicUsize,
         list_calls: AtomicUsize,
@@ -4094,6 +4316,7 @@ mod latest_version_tests {
                         ..Default::default()
                     },
                 ],
+                listing_keys: &[],
                 stable_calls: AtomicUsize::new(0),
                 stable_info_calls: AtomicUsize::new(0),
                 list_calls: AtomicUsize::new(0),
@@ -4112,6 +4335,13 @@ mod latest_version_tests {
 
         fn with_remote_versions(mut self, remote_versions: Vec<VersionInfo>) -> Self {
             self.remote_versions = remote_versions;
+            self
+        }
+
+        /// Declare tool options that shape this backend's version listing, the way the real
+        /// github/spm/ubi/http/s3 backends do.
+        fn with_listing_keys(mut self, listing_keys: &'static [&'static str]) -> Self {
+            self.listing_keys = listing_keys;
             self
         }
 
@@ -4136,6 +4366,10 @@ mod latest_version_tests {
 
         fn ba(&self) -> &Arc<BackendArg> {
             &self.ba
+        }
+
+        fn remote_version_listing_tool_option_keys(&self) -> &'static [&'static str] {
+            self.listing_keys
         }
 
         async fn _list_remote_versions(
@@ -4590,6 +4824,86 @@ mod latest_version_tests {
         );
     }
 
+    /// The regression this fixes: two option values that produce different listings shared one
+    /// cache entry, so whichever ran first answered for both. `short` is the same for the two
+    /// (inline opts are stripped from it), so they do share a cache *directory* — only the key
+    /// keeps them apart.
+    #[tokio::test]
+    async fn test_remote_versions_cache_is_partitioned_by_listing_options() {
+        let config = Config::get().await.unwrap();
+        let version = |v: &str| VersionInfo {
+            version: v.to_string(),
+            ..Default::default()
+        };
+
+        let alpha = LatestBackend::new("test-listing-opts-partition[version_prefix=a-]")
+            .with_listing_keys(&["version_prefix"])
+            .with_remote_versions(vec![version("1.0.0")]);
+        let beta = LatestBackend::new("test-listing-opts-partition[version_prefix=b-]")
+            .with_listing_keys(&["version_prefix"])
+            .with_remote_versions(vec![version("2.0.0")]);
+        // Same value as `alpha`, different canned list: it must never be asked for it.
+        let alpha_again = LatestBackend::new("test-listing-opts-partition[version_prefix=a-]")
+            .with_listing_keys(&["version_prefix"])
+            .with_remote_versions(vec![version("3.0.0")]);
+        assert_eq!(alpha.ba().cache_path, beta.ba().cache_path);
+        let _ = fs::remove_dir_all(&alpha.ba().cache_path);
+
+        assert_eq!(
+            alpha.list_remote_versions(&config).await.unwrap(),
+            vec!["1.0.0".to_string()]
+        );
+        // The defect: this read back the list `alpha` had cached under the shared key.
+        assert_eq!(
+            beta.list_remote_versions(&config).await.unwrap(),
+            vec!["2.0.0".to_string()]
+        );
+        // Same option value, same entry — which is what shows the key follows the value rather
+        // than the instance, and that the fix did not trade staleness for a refetch every time.
+        assert_eq!(
+            alpha_again.list_remote_versions(&config).await.unwrap(),
+            vec!["1.0.0".to_string()]
+        );
+        assert_eq!(alpha_again.list_calls(), 0);
+    }
+
+    /// The other half of it: declaring listing options must not partition anything on its own.
+    /// With no local override there is no context, so the list has to land on the contextless
+    /// entry — that is the state in which the shared versions host stays available, and a
+    /// context here would take it away from every default installation of the tool.
+    #[tokio::test]
+    async fn test_declared_listing_keys_without_override_use_the_default_cache_entry() {
+        let config = Config::get().await.unwrap();
+        let backend = LatestBackend::new("test-listing-opts-shared")
+            .with_listing_keys(&["api_url", "version_prefix"])
+            .with_remote_versions(vec![VersionInfo {
+                version: "1.0.0".to_string(),
+                ..Default::default()
+            }]);
+        backend
+            .get_remote_version_cache()
+            .lock()
+            .await
+            .clear()
+            .unwrap();
+
+        assert_eq!(
+            backend.list_remote_versions(&config).await.unwrap(),
+            vec!["1.0.0".to_string()]
+        );
+
+        // `get_remote_version_cache()` is the `context: None` handle. Had a context been
+        // produced, the list would have been written somewhere else and this would be empty.
+        let cached = backend
+            .get_remote_version_cache()
+            .lock()
+            .await
+            .get_cached()
+            .unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].version, "1.0.0");
+    }
+
     #[tokio::test]
     async fn test_offline_latest_uses_fast_path_when_available() {
         let config = Config::get().await.unwrap();
@@ -4687,6 +5001,7 @@ mod latest_version_tests {
             stable_result: Some("9.9.9".to_string()),
             stable_info: None,
             remote_versions: vec![],
+            listing_keys: &[],
             stable_calls: AtomicUsize::new(0),
             stable_info_calls: AtomicUsize::new(0),
             list_calls: AtomicUsize::new(0),
@@ -4727,7 +5042,7 @@ mod latest_version_tests {
 
 /// Helper function for calculating install operation count in HTTP/S3-style backends.
 /// Used by HttpBackend and S3Backend to avoid code duplication.
-pub fn http_install_operation_count(
+pub(crate) fn http_install_operation_count(
     has_checksum_opt: bool,
     platform_key: &str,
     tv: &ToolVersion,
@@ -4752,7 +5067,7 @@ pub fn http_install_operation_count(
 /// Check that the provenance type recorded in the lockfile is still enabled in settings.
 /// `is_disabled` receives the provenance type and returns `Ok(true)` when the corresponding
 /// setting is off, or `Err` for provenance types unexpected in the calling backend.
-pub fn ensure_provenance_setting_enabled(
+pub(crate) fn ensure_provenance_setting_enabled(
     tv: &ToolVersion,
     platform_key: &str,
     is_disabled: impl FnOnce(&ProvenanceType) -> Result<bool>,
@@ -4853,10 +5168,23 @@ pub(crate) fn fuzzy_match_versions(
     // but NOT "1.20". The old pattern achieved this by requiring a separator after the query.
     // However, vendor-prefixed queries like "temurin-" need to match digits immediately after
     // the prefix (e.g. "temurin-25.0.1").
+    // `+` separates semver build metadata ("1.9.1" -> "1.9.1+hotfix.2"), but it
+    // also separates flavour names ("truffleruby" -> "truffleruby+graalvm"). Only
+    // treat it as a separator for numeric queries, so a bare flavour name cannot
+    // select a different flavour.
+    let numeric_query = query
+        .strip_prefix(['v', 'V'])
+        .unwrap_or(query)
+        .starts_with(|c: char| c.is_ascii_digit());
+    let sep = if query == "latest" || numeric_query {
+        "[+\\-.]"
+    } else {
+        "[\\-.]"
+    };
     let query_regex = if query != "latest" && query.ends_with('-') {
         Regex::new(&format!("^{query_pattern}.*$")).unwrap()
     } else {
-        Regex::new(&format!("^{query_pattern}([+\\-.].+)?$")).unwrap()
+        Regex::new(&format!("^{query_pattern}({sep}.+)?$")).unwrap()
     };
 
     // Also create a regex without the 'v' prefix if query starts with 'v'
@@ -4866,7 +5194,7 @@ pub(crate) fn fuzzy_match_versions(
         let re = if query.ends_with('-') {
             Regex::new(&format!("^{without_v}.*$")).unwrap()
         } else {
-            Regex::new(&format!("^{without_v}([+\\-.].+)?$")).unwrap()
+            Regex::new(&format!("^{without_v}({sep}.+)?$")).unwrap()
         };
         Some(re)
     } else {
@@ -4895,7 +5223,7 @@ pub(crate) fn fuzzy_match_versions(
         .collect()
 }
 
-pub fn unalias_backend(backend: &str) -> &str {
+pub(crate) fn unalias_backend(backend: &str) -> &str {
     match backend {
         "dotnet-core" => "dotnet",
         "nodejs" => "node",
@@ -4945,9 +5273,14 @@ impl Ord for dyn Backend {
     }
 }
 
-pub async fn reset() -> Result<()> {
+pub(crate) async fn reset() -> Result<()> {
     install_state::reset();
-    *TOOLS.lock().unwrap() = None;
+    {
+        let mut tools = TOOLS.lock().unwrap();
+        *tools = None;
+        *TOOLS_SEEDED.lock().unwrap() = None;
+        TOOLS_INCLUDE_INSTALLED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     load_tools().await?;
     Ok(())
 }

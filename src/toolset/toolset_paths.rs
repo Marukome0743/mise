@@ -16,7 +16,7 @@ use itertools::Itertools;
 pub(super) static LIST_PATHS_CACHE: Lazy<DashMap<String, Vec<PathBuf>>> = Lazy::new(DashMap::new);
 
 impl Toolset {
-    pub async fn list_paths(&self, config: &Arc<Config>) -> Vec<PathBuf> {
+    pub(crate) async fn list_paths(&self, config: &Arc<Config>) -> Vec<PathBuf> {
         // Build a stable cache key based on project_root and current installed versions
         let mut key_parts = vec![];
         if let Some(root) = &config.project_root {
@@ -62,7 +62,7 @@ impl Toolset {
     }
 
     /// same as list_paths but includes config.list_paths, venv paths, and MISE_ADD_PATHs from self.env()
-    pub async fn list_final_paths(
+    pub(crate) async fn list_final_paths(
         &self,
         config: &Arc<Config>,
         env_results: EnvResults,
@@ -80,7 +80,7 @@ impl Toolset {
             paths.push(venv.venv_path.clone());
         }
 
-        // 4. tool_add_paths (MISE_ADD_PATH/RTX_ADD_PATH from tools)
+        // 4. tool_add_paths (MISE_ADD_PATH from tools)
         paths.extend(env_results.tool_add_paths);
 
         // 5. Tool paths
@@ -94,7 +94,7 @@ impl Toolset {
     /// Returns paths separated by their source: (user_configured_paths, tool_paths)
     /// User-configured paths should never be filtered, while tool paths should be filtered
     /// if they duplicate entries in the original PATH.
-    pub async fn list_final_paths_split(
+    pub(crate) async fn list_final_paths_split(
         &self,
         config: &Arc<Config>,
         env_results: EnvResults,
@@ -115,7 +115,7 @@ impl Toolset {
             tool_paths.push(venv.venv_path.clone());
         }
 
-        // tool_add_paths (MISE_ADD_PATH/RTX_ADD_PATH from tools)
+        // tool_add_paths (MISE_ADD_PATH from tools)
         tool_paths.extend(env_results.tool_add_paths);
 
         // Tool installation paths

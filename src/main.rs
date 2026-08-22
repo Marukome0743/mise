@@ -1,4 +1,5 @@
 #![allow(unknown_lints)]
+#![deny(dead_code_pub_in_binary, unreachable_pub)]
 // eyre 0.6.12 emits a trailing semicolon from bail!, which nightly rejects.
 #![allow(semicolon_in_expressions_from_macros)]
 
@@ -111,6 +112,14 @@ fn main() -> ExitCode {
     // build. Dispatch on argv0 before runtime, logging, clap, or config startup.
     if cache::session::is_rustc_shim() {
         return cache::session::run_rustc_shim();
+    }
+    // Same reason, different caller: `self-replace` spawns a copy of this binary under a generated
+    // name to finish an update, and when its own init hook does not intercept that, mise would run
+    // its shim path and report the generated name as a broken shim. There is nothing for `main` to
+    // do here — the copy exists to be deleted — so leave before anything else starts.
+    #[cfg(windows)]
+    if env::invoked_as_self_replace_helper() {
+        return ExitCode::SUCCESS;
     }
     let nprocs = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -261,7 +270,7 @@ fn stop_multi_progress() {
 
 static ASYNC_PANIC_OCCURRED: AtomicBool = AtomicBool::new(false);
 
-pub fn install_panic_hook(panic_hook: color_eyre::config::PanicHook) {
+fn install_panic_hook(panic_hook: color_eyre::config::PanicHook) {
     panic::set_hook(Box::new(move |panic_info| {
         // Serious release builds abort after this hook returns, so destructors
         // and catch_unwind cleanup will not run. Terminate registered child

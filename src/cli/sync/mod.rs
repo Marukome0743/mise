@@ -3,11 +3,12 @@ use eyre::Result;
 
 mod node;
 mod python;
+mod reconcile;
 mod ruby;
 
 #[derive(Debug, clap::Args)]
 #[clap(about = "Synchronize tools from other version managers with mise")]
-pub struct Sync {
+pub(crate) struct Sync {
     #[clap(subcommand)]
     command: Commands,
 }
@@ -20,7 +21,7 @@ enum Commands {
 }
 
 impl Commands {
-    pub async fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         match self {
             Self::Node(cmd) => cmd.run().await,
             Self::Python(cmd) => cmd.run().await,
@@ -30,7 +31,7 @@ impl Commands {
 }
 
 impl Sync {
-    pub async fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         self.command.run().await
     }
 }

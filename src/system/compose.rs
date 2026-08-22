@@ -6,12 +6,12 @@ use eyre::{Result, bail, eyre};
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
-use crate::system::resources::{ResourceAction, ResourceId, ResourcePlan};
+use crate::config::{Config, ConfigMap};
+use crate::system::resources::{ResourceAction, ResourceId, ResourceOrigin, ResourcePlan};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ComposeState {
+pub(crate) enum ComposeState {
     #[default]
     Running,
     Stopped,
@@ -20,7 +20,7 @@ pub enum ComposeState {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ComposePullPolicy {
+pub(crate) enum ComposePullPolicy {
     Always,
     #[default]
     Missing,
@@ -29,7 +29,7 @@ pub enum ComposePullPolicy {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ComposeBuildPolicy {
+pub(crate) enum ComposeBuildPolicy {
     #[default]
     Auto,
     Always,
@@ -38,7 +38,7 @@ pub enum ComposeBuildPolicy {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ComposeRecreatePolicy {
+pub(crate) enum ComposeRecreatePolicy {
     #[default]
     Auto,
     Always,
@@ -47,13 +47,13 @@ pub enum ComposeRecreatePolicy {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ComposeRemoveImages {
+pub(crate) enum ComposeRemoveImages {
     Local,
     All,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct ComposeTomlConfig {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub(crate) struct ComposeTomlConfig {
     pub project_dir: PathBuf,
     #[serde(default)]
     pub files: Vec<PathBuf>,
@@ -100,7 +100,7 @@ pub struct ComposeTomlConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct ComposeRequest {
+pub(crate) struct ComposeRequest {
     pub name: String,
     project_dir: PathBuf,
     files: Vec<PathBuf>,
@@ -125,6 +125,7 @@ pub struct ComposeRequest {
     engine_command: Vec<String>,
     explicit_dependencies: Vec<ResourceId>,
     path_dependencies: Vec<ResourceId>,
+    origin: Option<ResourceOrigin>,
     inspection: Option<ComposeInspection>,
 }
 
@@ -154,28 +155,60 @@ struct ComposeContainer {
     config_hash: Option<String>,
 }
 
-pub fn prepare_requests_from_config(config: &Config) -> Result<Vec<ComposeRequest>> {
+pub(crate) fn prepare_requests_from_config(config: &Config) -> Result<Vec<ComposeRequest>> {
+    let mut composed: IndexMap<String, (ComposeTomlConfig, ResourceOrigin)> = IndexMap::new();
+    for config_files in config.bootstrap_config_maps() {
+        for (name, declaration) in compose_from_config_files(config_files) {
+            if let Some(existing) = composed.get(&name) {
+                if existing.0 == declaration.0 {
+                    continue;
+                }
+                bail!(
+                    "conflicting bootstrap compose declarations for {name}\n\n  first:\n    {}\n\n  second:\n    {}",
+                    existing.1.conflict_description(),
+                    declaration.1.conflict_description(),
+                );
+            }
+            composed.insert(name, declaration);
+        }
+    }
+    composed
+        .into_iter()
+        .map(|(name, (config, origin))| {
+            ComposeRequest::from_toml_with_origin(name, config, Some(origin))
+        })
+        .collect()
+}
+
+fn compose_from_config_files(
+    config_files: &ConfigMap,
+) -> IndexMap<String, (ComposeTomlConfig, ResourceOrigin)> {
     let mut merged = IndexMap::new();
-    for cf in config.config_files.values() {
+    for (path, cf) in config_files {
         if let Some(bootstrap) = cf.bootstrap_config() {
+            let origin = ResourceOrigin {
+                config: path.clone(),
+                config_root: cf.config_root(),
+                environment: crate::config::environments_for_config_path(path),
+                source: None,
+            };
             for (name, project) in bootstrap.compose {
-                merged.entry(name).or_insert(project);
+                merged
+                    .entry(name)
+                    .or_insert_with(|| (project, origin.clone()));
             }
         }
     }
     merged
-        .into_iter()
-        .map(|(name, config)| ComposeRequest::from_toml(name, config))
-        .collect()
 }
 
-pub fn requests_from_config(config: &Config) -> Result<Vec<ComposeRequest>> {
+pub(crate) fn requests_from_config(config: &Config) -> Result<Vec<ComposeRequest>> {
     let mut requests = prepare_requests_from_config(config)?;
     inspect_requests(&mut requests);
     Ok(requests)
 }
 
-pub fn inspect_requests(requests: &mut [ComposeRequest]) {
+pub(crate) fn inspect_requests(requests: &mut [ComposeRequest]) {
     for request in requests {
         request.inspection = Some(
             request
@@ -185,18 +218,18 @@ pub fn inspect_requests(requests: &mut [ComposeRequest]) {
     }
 }
 
-pub fn plans(requests: &[ComposeRequest], dependency_changed: bool) -> Vec<ResourcePlan> {
+pub(crate) fn plans(requests: &[ComposeRequest], dependency_changed: bool) -> Vec<ResourcePlan> {
     requests
         .iter()
         .map(|request| request.plan_with_dependency_change(dependency_changed))
         .collect()
 }
 
-pub fn apply(requests: &[ComposeRequest], dry_run: bool, yes: bool) -> Result<()> {
+pub(crate) fn apply(requests: &[ComposeRequest], dry_run: bool, yes: bool) -> Result<()> {
     apply_with_dry_run_actions(requests, &HashMap::new(), dry_run, yes)
 }
 
-pub fn apply_with_dry_run_actions(
+pub(crate) fn apply_with_dry_run_actions(
     requests: &[ComposeRequest],
     dry_run_actions: &HashMap<String, ResourceAction>,
     dry_run: bool,
@@ -267,7 +300,16 @@ fn apply_action(
 }
 
 impl ComposeRequest {
+    #[cfg(test)]
     fn from_toml(name: String, config: ComposeTomlConfig) -> Result<Self> {
+        Self::from_toml_with_origin(name, config, None)
+    }
+
+    fn from_toml_with_origin(
+        name: String,
+        config: ComposeTomlConfig,
+        origin: Option<ResourceOrigin>,
+    ) -> Result<Self> {
         if name.is_empty() {
             bail!("bootstrap compose project names cannot be empty");
         }
@@ -358,25 +400,31 @@ impl ComposeRequest {
             engine_command: config.engine_command,
             explicit_dependencies,
             path_dependencies,
+            origin,
             inspection: None,
         })
     }
 
-    pub fn explicit_dependencies(&self) -> &[ResourceId] {
+    pub(crate) fn explicit_dependencies(&self) -> &[ResourceId] {
         &self.explicit_dependencies
     }
 
-    pub fn path_dependencies(&self) -> &[ResourceId] {
+    pub(crate) fn path_dependencies(&self) -> &[ResourceId] {
         &self.path_dependencies
     }
 
-    pub fn plan(&self) -> ResourcePlan {
+    pub(crate) fn plan(&self) -> ResourcePlan {
         let id = ResourceId::new("compose", &self.name);
         let desired = self.desired();
         let Some(inspection) = &self.inspection else {
-            return ResourcePlan::new(id, "not inspected", desired, ResourceAction::Unknown);
+            return self.with_origin(ResourcePlan::new(
+                id,
+                "not inspected",
+                desired,
+                ResourceAction::Unknown,
+            ));
         };
-        match inspection {
+        let plan = match inspection {
             ComposeInspection::Unavailable(reason) => ResourcePlan::new(
                 id,
                 format!("unavailable: {reason}"),
@@ -433,10 +481,18 @@ impl ComposeRequest {
                     action,
                 )
             }
+        };
+        self.with_origin(plan)
+    }
+
+    fn with_origin(&self, plan: ResourcePlan) -> ResourcePlan {
+        match &self.origin {
+            Some(origin) => plan.with_origin(origin.clone()),
+            None => plan,
         }
     }
 
-    pub fn plan_with_dependency_change(&self, dependency_changed: bool) -> ResourcePlan {
+    pub(crate) fn plan_with_dependency_change(&self, dependency_changed: bool) -> ResourcePlan {
         let mut plan = self.plan();
         if dependency_changed && self.state == ComposeState::Running {
             match plan.action {

@@ -5,7 +5,7 @@ use crate::env::{join_paths, split_paths};
 use crate::env_diff::{EnvDiff, EnvDiffOperation, EnvMap};
 use crate::file::{canonicalize_cached, display_path, display_rel_path};
 use crate::hook_env::{PREV_SESSION, WatchFilePattern};
-use crate::shell::{ShellType, get_shell};
+use crate::shell::{EXAMPLE_SHELL, ShellType, require_shell};
 use crate::toolset::{ResolveOptions, Toolset, ToolsetBuilder};
 use crate::ui::style;
 use crate::{env, hook_env, hooks, watch_files};
@@ -20,7 +20,7 @@ use std::{borrow::Cow, sync::Arc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "lowercase")]
-pub enum HookReason {
+pub(crate) enum HookReason {
     Precmd,
     Chpwd,
 }
@@ -28,7 +28,7 @@ pub enum HookReason {
 /// [internal] called by activate hook to update env vars directory change
 #[derive(Debug, clap::Args)]
 #[clap(hide = true)]
-pub struct HookEnv {
+pub(crate) struct HookEnv {
     /// Skip early exit check
     #[clap(long, short)]
     force: bool,
@@ -51,8 +51,11 @@ pub struct HookEnv {
 }
 
 impl HookEnv {
-    pub async fn run(self) -> Result<()> {
-        let shell = get_shell(self.shell).expect("no shell provided, use `--shell=zsh`");
+    pub(crate) async fn run(self) -> Result<()> {
+        let shell = require_shell(
+            self.shell,
+            &format!("Name the shell: `mise hook-env --shell {EXAMPLE_SHELL}`."),
+        )?;
         let config = match Config::get().await {
             Ok(config) => config,
             Err(err) => {

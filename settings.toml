@@ -107,14 +107,6 @@ description = "Use cosign to verify aqua tool signatures."
 env = "MISE_AQUA_COSIGN"
 type = "Bool"
 
-[aqua.cosign_extra_args]
-description = "Extra arguments to pass to cosign when verifying aqua tool signatures."
-env = "MISE_AQUA_COSIGN_EXTRA_ARGS"
-optional = true
-parse_env = "list_by_comma"
-rust_type = "Vec<String>"
-type = "ListString"
-
 [aqua.github_attestations]
 default = true
 description = "Enable GitHub Artifact Attestations verification for aqua tools."
@@ -686,6 +678,27 @@ tool versions, settings, or watched files change.
 """
 env = "MISE_ENV_CACHE_TTL"
 type = "Duration"
+
+[env_conf_d]
+description = "Enable environment-specific filenames in conf.d directories."
+docs = """
+When enabled, files in `.mise/conf.d` and `.config/mise/conf.d` use environment
+suffixes: `tools.development.toml` loads only when `development` is active, and
+`tools.development.local.toml` is its local variant.
+
+This behavior is opt-in during the migration period. When disabled or unset,
+all non-hidden TOML files in `conf.d` continue to load unconditionally. Dots in
+unconditional fragment names are deprecated; rename `node.tools.toml` to
+`node-tools.toml` before mise 2027.8.10.
+
+This is an early-init setting: it must be set in a `miserc.toml` file or via the
+`MISE_ENV_CONF_D` environment variable. Setting it in `mise.toml` has no effect
+because config file discovery has already occurred by the time `mise.toml` is read.
+"""
+env = "MISE_ENV_CONF_D"
+optional = true
+rc = true
+type = "Bool"
 
 [env_file]
 description = "Path to a file containing environment variables to automatically load."
@@ -1323,6 +1336,28 @@ parse_env = "set_by_comma"
 rust_type = "BTreeSet<String>"
 type = "SetString"
 
+[idiomatic_version_file_ignore_minimum_versions]
+default = false
+description = "Ignore idiomatic version file fields that only declare a minimum compatible version."
+docs = """
+Some idiomatic version files carry a *minimum* compatible version rather than the version the
+project is built with. mise used to resolve those, which is wrong -- a floor says nothing about
+which version a project is developed against. They are deprecated and warn; set this to opt into
+the final behavior now, which ignores them and silences the warning:
+
+    mise settings set idiomatic_version_file_ignore_minimum_versions true
+
+Affects `go.mod`'s `go X.Y` directive (`toolchain goX.Y.Z` is still read) and `CMakeLists.txt`'s
+`cmake_minimum_required`.
+
+This is a temporary migration setting. In mise 2026.11.0 the behavior becomes unconditional and
+this setting is removed. See
+[Idiomatic Version Files](/configuration.html#which-fields-mise-reads).
+"""
+env = "MISE_IDIOMATIC_VERSION_FILE_IGNORE_MINIMUM_VERSIONS"
+hide = true
+type = "Bool"
+
 [ignored_config_paths]
 default = []
 description = "This is a list of config paths that mise will ignore."
@@ -1335,6 +1370,11 @@ config file discovery has already occurred by the time `mise.toml` is read.
 
 Paths are separated by the OS path separator when using the environment variable,
 `mise settings set`, or `mise settings add` (`:` on Unix, `;` on Windows).
+
+Relative paths in `.miserc.toml` are resolved from the directory containing that
+file. Relative paths from the environment or CLI are resolved from the directory
+where mise was invoked. Glob patterns are supported, including recursive `**`
+patterns. Paths without glob metacharacters retain directory-prefix matching.
 """
 env = "MISE_IGNORED_CONFIG_PATHS"
 parse_env = "list_by_os_path_separator"
@@ -2819,6 +2859,22 @@ Enable the versioned HTTP remote build-cache protocol at this base URL. Remote a
 env = "MISE_TASK_CACHE_REMOTE_URL"
 optional = true
 type = "Url"
+
+[task.cache.stats_report]
+description = "[experimental] File to write action-cache session statistics to."
+docs = """
+Write a versioned JSON report describing Rust action-cache activity, transfer volume, restored
+outputs, and phase timings. Timing values use nanoseconds. Concurrent phase timings are cumulative
+work time and can exceed the end-to-end `session_duration_ns`; `prefetch_duration_ns` is the sum of
+wall-clock durations for each task prefetch run.
+
+This is intended for CI qualification and benchmarking. Relative paths resolve against mise's
+working directory. The report is replaced atomically after each `mise run` invocation that creates
+an action-cache session.
+"""
+env = "MISE_TASK_CACHE_STATS_REPORT"
+optional = true
+type = "Path"
 
 [task.cache_dir]
 description = "[experimental] Directory for task output cache artifacts."

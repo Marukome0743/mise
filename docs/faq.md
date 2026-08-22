@@ -246,11 +246,12 @@ mise upgrade --bump node
 ## My config file is being ignored / `mise trust` issues
 
 mise requires you to trust config files that were not created by you. Safe config files —
-those that only contain `min_version`, `[tools]` entries with plain version strings (or
-arrays of them), and `[tasks]` (no templates and no tool options) — are loaded without trust, since nothing in
-them executes code at load time: tools install and tasks run only on explicit commands like
-`mise install` or `mise run`. Everything else (env vars, hooks, settings, aliases, templates,
-tool options) requires trust. Common issues:
+those that only contain `min_version`, `[tools]` entries whose values are plain version
+strings or arrays of strings, and `[tasks]` without templates — load without trust. Tool-option
+tables and other top-level settings require trust. In normal mode, `mise run`, naked task
+invocations such as `mise <TASK>`, `mise install`, `mise exec`, and `mise watch` automatically
+trust the active config because they explicitly execute project-defined behavior. Other unsafe
+config requires trust. Common issues:
 
 - **Accidentally denied trust**: If mise prompted you to trust a file and you said no, it gets
   added to the ignore list. Check the `ignored-configs` directory in your
@@ -259,17 +260,18 @@ tool options) requires trust. Common issues:
 - **Symlinked configs**: If your config is symlinked (e.g., via GNU Stow), mise may track the
   symlink target path. Try `mise trust` pointing to the actual file path.
 - **CI**: In detected CI, mise assumes configs are trusted unless paranoid mode is enabled.
-- **Non-interactive mode**: In non-interactive shells outside detected CI, such as IDE extensions or
-  scripts without a TTY, mise cannot prompt you to trust a config. Commands that directly load an
-  untrusted `mise.toml` can fail with an untrusted-config error. Commands that discover previously
-  tracked configs may skip untrusted entries instead. Either run `mise trust` beforehand or set
+- **Non-interactive mode**: In a non-interactive shell, such as an IDE extension or script without
+  a TTY, mise cannot prompt you to trust a config. Outside normal-mode `mise run`, `mise <TASK>`,
+  `mise install`, `mise exec`, and `mise watch`, commands that directly load an untrusted
+  `mise.toml` can fail with an untrusted-config error. Commands that discover previously tracked
+  configs may skip untrusted entries instead. Either run `mise trust` beforehand or set
   [`trusted_config_paths`](/configuration/settings.html#trusted_config_paths) in your global settings
   for configs you trust.
 - **Global config** (`~/.config/mise/config.toml`) should be auto-trusted. If it's not, run
   `mise trust ~/.config/mise/config.toml` explicitly.
 
-Run `mise doctor` (`mise dr`) to see if any config files are untrusted — it will list them
-under "problems".
+Run `mise doctor` (`mise dr`) to see if any config files are untrusted — it will
+list them under "problems".
 
 ## How do idiomatic version files (`.python-version`, `.node-version`, etc.) work?
 
@@ -349,7 +351,57 @@ Things mise does **not** do:
 - Handle system-level dependencies that tools need to compile
 
 If a mise-installed tool needs a system library, install that library with your OS package
-manager first.
+manager first. You can declare those packages in
+[`[bootstrap.packages]`](/bootstrap/packages/) so `mise bootstrap` installs them: through
+apt/dnf/pacman where the platform's package manager owns them, or through mise's built-in
+Homebrew installers for `brew:` and `brew-cask:` entries, which do not require Homebrew
+itself. Either way they are host packages, not `[tools]` entries.
+
+## How do I install tools other users can run without mise?
+
+Two features install binaries that work on `PATH` with no mise involved at runtime.
+
+Use [`[bootstrap.packages]`](/bootstrap/packages/) with `brew:` entries for tools that have
+a Homebrew formula:
+
+```toml
+[bootstrap.packages]
+"brew:ffmpeg" = "latest"
+"brew:jq" = "latest"
+```
+
+mise pours bottles into the canonical prefix (`/home/linuxbrew/.linuxbrew` on Linux,
+`/opt/homebrew` on arm64 macOS) with the usual `<prefix>/bin` links, and does not require
+Homebrew itself to be installed. Once `<prefix>/bin` is on `PATH`, the binaries behave like
+any other Homebrew install.
+[Keg-only](https://docs.brew.sh/FAQ#what-does-keg-only-mean) formulae are the exception:
+like brew, mise leaves them out of the prefix, so their binaries stay at
+`<prefix>/opt/<name>/bin`.
+
+On arm64 macOS and x86_64/arm64 Linux, where mise's brew manager runs,
+`mise bootstrap packages import --manager brew` snapshots an existing Homebrew or Linuxbrew
+setup into your config — the formulae you installed on request, or every linked formula
+with `--all`.
+
+Use [`mise install-into`](/cli/install-into.html) for any backend mise supports. It installs
+one tool version into a directory you pick, for use outside of mise:
+
+```sh
+mise install-into node@22 /opt/node
+/opt/node/bin/node -v
+```
+
+Point it at a new or empty directory: `install-into` deletes whatever is already at the
+destination, after a confirmation prompt that defaults to no, or without asking under
+`--yes`. It only writes to that directory, so add its `bin` to `PATH` yourself the way you
+would the brew prefix above. Tools that expect environment variables such as `JAVA_HOME`,
+or other configuration mise normally applies at runtime, still need those set up by hand.
+
+Both approaches make the same trade Homebrew makes: one version on `PATH` for everyone,
+with no per-project version selection. When you want that selection, keep the tools in
+`[tools]` and let [`mise bootstrap`](/bootstrap.html) converge each user's activation,
+config, and tools in one command — or across many hosts with
+[`mise bootstrap remote`](/bootstrap/remote.html).
 
 ## How does mise versioning work?
 

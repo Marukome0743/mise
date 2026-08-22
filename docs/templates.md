@@ -182,6 +182,7 @@ These variables offer key information about the current environment:
 
 - `env: HashMap<String, String>` – Accesses current environment variables as
   a key-value map.
+- `vars: HashMap<String, String>` – Accesses user-defined [configuration variables](/configuration/vars).
 - `cwd: PathBuf` – Points to the current working directory.
 - `config_root: PathBuf` – Locates the directory containing your `mise.toml` file, or in the case of something like `~/src/myproj/.config/mise.toml`, it will point to `~/src/myproj`.
 - `mise_bin: String` - Points to the path to the current mise executable
@@ -520,13 +521,14 @@ parsed — so only information available at OS level can be used.
 <div v-pre>
 
 ```toml
-# ~/.config/mise/miserc.toml
+# /workspaces/vcs/.config/miserc.toml
 
 # Use $HOME to set a ceiling path (stops config search at home directory)
 ceiling_paths = ["{{ env.HOME }}"]
 
-# Ignore a config path relative to home
-ignored_config_paths = ["{{ env.HOME }}/shared"]
+# Paths are relative to the directory containing this miserc file.
+# Recursive glob patterns are supported.
+ignored_config_paths = ["../vendor/**/mise.toml"]
 ```
 
 </div>

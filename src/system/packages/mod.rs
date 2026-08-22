@@ -8,21 +8,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::result::Result;
+use crate::system::ManagerPackageOptions;
 
-pub mod apk;
-pub mod apt;
+pub(crate) mod apk;
+pub(crate) mod apt;
 #[cfg(unix)]
-pub mod brew;
-pub mod dnf;
-pub mod flatpak;
-pub mod mas;
-pub mod pacman;
-pub mod plugin;
+pub(crate) mod brew;
+pub(crate) mod dnf;
+pub(crate) mod flatpak;
+pub(crate) mod mas;
+pub(crate) mod pacman;
+pub(crate) mod plugin;
 
 /// A single package entry from `[bootstrap.packages]` — the part after the
 /// `manager:` prefix of a `"manager:package" = "version"` config entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PackageRequest {
+pub(crate) struct PackageRequest {
     /// package name as written in the spec (apt: may carry an `:arch`
     /// qualifier like "gcc:arm64"; brew/brew-cask: full name incl. "@17")
     pub name: String,
@@ -46,8 +47,15 @@ impl std::fmt::Display for PackageRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PackageState {
+pub(crate) enum PackageState {
     Installed {
+        version: String,
+    },
+    /// Installed cask whose upstream definition declares `auto_updates`.
+    /// The version is the cask receipt version, not necessarily the live app
+    /// bundle version after it has updated itself.
+    #[cfg(unix)]
+    InstalledAutoUpdates {
         version: String,
     },
     Missing,
@@ -69,14 +77,31 @@ pub enum PackageState {
 }
 
 impl PackageState {
+    pub(crate) fn is_installed(&self) -> bool {
+        match self {
+            Self::Installed { .. } => true,
+            #[cfg(unix)]
+            Self::InstalledAutoUpdates { .. } => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn auto_updates(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Self::InstalledAutoUpdates { .. } => true,
+            _ => false,
+        }
+    }
+
     #[cfg(unix)]
-    pub fn unavailable(reason: impl Into<String>) -> Self {
+    pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
         Self::Unavailable {
             reason: reason.into(),
         }
     }
 
-    pub fn is_unavailable(&self) -> bool {
+    pub(crate) fn is_unavailable(&self) -> bool {
         #[cfg(unix)]
         if matches!(self, Self::Unavailable { .. }) {
             return true;
@@ -84,7 +109,7 @@ impl PackageState {
         false
     }
 
-    pub fn unavailable_reason(&self) -> Option<&str> {
+    pub(crate) fn unavailable_reason(&self) -> Option<&str> {
         #[cfg(unix)]
         if let Self::Unavailable { reason } = self {
             return Some(reason);
@@ -94,13 +119,13 @@ impl PackageState {
 }
 
 #[derive(Debug, Clone)]
-pub struct PackageStatus {
+pub(crate) struct PackageStatus {
     pub request: PackageRequest,
     pub state: PackageState,
 }
 
 #[derive(Debug, Default)]
-pub struct InstallOpts {
+pub(crate) struct InstallOpts {
     /// print what would be done without doing it
     pub dry_run: bool,
     /// force a package manager metadata refresh before installing
@@ -112,7 +137,7 @@ pub struct InstallOpts {
 // awaits. The driver awaits managers sequentially on one task, so the
 // futures never cross threads.
 #[async_trait(?Send)]
-pub trait SystemPackageManager: Send + Sync {
+pub(crate) trait SystemPackageManager: Send + Sync {
     /// config key, e.g. "apt", "brew"
     fn name(&self) -> &str;
 
@@ -136,8 +161,34 @@ pub trait SystemPackageManager: Send + Sync {
     /// Query installed state. Must be side-effect free and never elevate.
     async fn installed(&self, pkgs: &[PackageRequest]) -> Result<Vec<PackageStatus>>;
 
+    /// Whether each name exists as an installable package, positionally.
+    ///
+    /// This is *availability*, not installed state — [`Self::installed`]
+    /// cannot answer it (apt's asks dpkg, which only knows what is already on
+    /// the box). Used to resolve a plugin's candidate package names, where the
+    /// same capability is packaged under different names across distro
+    /// releases. Must be side-effect free and never elevate.
+    ///
+    /// The default reports every name as available, which makes candidate
+    /// resolution pick the first one — the behavior before candidate lists
+    /// existed. Managers override it where the query is cheap.
+    async fn available(&self, names: &[String]) -> Result<Vec<bool>> {
+        Ok(vec![true; names.len()])
+    }
+
     /// Install the given packages (already filtered to missing, mismatched, or repairable).
     async fn install(&self, pkgs: &[PackageRequest], opts: &InstallOpts) -> Result<()>;
+
+    /// Install with manager-specific declarative options. Managers without
+    /// additional package options use the ordinary install path unchanged.
+    async fn install_with_options(
+        &self,
+        pkgs: &[PackageRequest],
+        opts: &InstallOpts,
+        _manager_options: &ManagerPackageOptions,
+    ) -> Result<()> {
+        self.install(pkgs, opts).await
+    }
 
     /// Upgrade the given packages (already filtered to installed ones).
     /// Defaults to `install` — for brew that is exactly right (pouring a
@@ -164,7 +215,7 @@ pub trait SystemPackageManager: Send + Sync {
     }
 }
 
-pub fn builtin_managers() -> Vec<Arc<dyn SystemPackageManager>> {
+pub(crate) fn builtin_managers() -> Vec<Arc<dyn SystemPackageManager>> {
     vec![
         Arc::new(apk::ApkManager::new()),
         Arc::new(apt::AptManager::new()),
@@ -180,13 +231,13 @@ pub fn builtin_managers() -> Vec<Arc<dyn SystemPackageManager>> {
     ]
 }
 
-pub fn is_builtin_manager_name(name: &str) -> bool {
+pub(crate) fn is_builtin_manager_name(name: &str) -> bool {
     builtin_managers()
         .iter()
         .any(|manager| manager.name() == name)
 }
 
-pub fn all_managers() -> Vec<Arc<dyn SystemPackageManager>> {
+pub(crate) fn all_managers() -> Vec<Arc<dyn SystemPackageManager>> {
     let mut managers = builtin_managers();
     let builtins = managers
         .iter()

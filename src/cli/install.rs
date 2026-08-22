@@ -34,7 +34,7 @@ use std::path::PathBuf;
 /// Tools will be installed in parallel. To disable, set `--jobs=1` or `MISE_JOBS=1`
 #[derive(Debug, Default, clap::Args)]
 #[clap(visible_alias = "i", verbatim_doc_comment, after_long_help = AFTER_LONG_HELP)]
-pub struct Install {
+pub(crate) struct Install {
     /// Tool(s) to install
     /// e.g.: node@20
     #[clap(value_name = "TOOL@VERSION")]
@@ -103,6 +103,11 @@ pub struct Install {
     ///
     /// Installs to /usr/local/share/mise/installs (or MISE_SYSTEM_DATA_DIR/installs).
     /// May require elevated permissions (e.g. sudo).
+    ///
+    /// This shares the install location between users; it does not put binaries on
+    /// PATH for use without mise. Every user still needs mise to run these tools.
+    /// For binaries usable without mise, see `mise install-into` or
+    /// `[bootstrap.packages]`.
     #[clap(long, verbatim_doc_comment, conflicts_with = "shared")]
     system: bool,
 
@@ -218,12 +223,7 @@ impl Install {
                 Ok(statuses) => {
                     missing += statuses
                         .iter()
-                        .filter(|s| {
-                            !matches!(
-                                s.state,
-                                crate::system::packages::PackageState::Installed { .. }
-                            ) && !s.state.is_unavailable()
-                        })
+                        .filter(|s| !s.state.is_installed() && !s.state.is_unavailable())
                         .count();
                 }
                 // a transient query failure must not start the 24h throttle
@@ -583,6 +583,7 @@ impl Install {
                     None,
                     Some(&[]),
                     self.is_dry_run(),
+                    false,
                 )
                 .await;
                 (vec![], Ok(()))

@@ -3,7 +3,9 @@ use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings, env_directive::EnvDirective};
 use crate::duration;
 use crate::env_diff::EnvDiff;
-use crate::file::{can_execute_directly, display_path, replace_path, strip_utf8_bom};
+use crate::file::{
+    can_execute_directly, canonicalize_or_self, display_path, replace_path, strip_utf8_bom,
+};
 use crate::sandbox::SandboxConfig;
 use crate::task::TaskArtifactCache;
 use crate::task::task_cache::{
@@ -16,7 +18,7 @@ use crate::task::task_output_handler::OutputHandler;
 use crate::task::task_scheduler::SchedMsg;
 use crate::task::task_script_parser::subcommand_name_from_parse;
 use crate::task::task_source_checker::{
-    remove_auto_output, save_checksum, sources_are_fresh, task_cwd,
+    remove_auto_output, save_checksum, sources_are_fresh, task_cwd, task_source_match_root,
 };
 use crate::task::{
     Deps, FailedTasks, GetMatchingExt, Task, TaskCacheAudit, TaskCacheMode, TaskCacheOutput,
@@ -29,6 +31,8 @@ use crate::ui::{style, time};
 use duct::IntoExecutablePath;
 use eyre::{Context, Report, Result, ensure, eyre};
 use indexmap::IndexMap;
+#[cfg(windows)]
+use indoc::formatdoc;
 use itertools::Itertools;
 #[cfg(unix)]
 use nix::errno::Errno;
@@ -88,6 +92,27 @@ struct PreparedTaskContext {
     env: BTreeMap<String, String>,
     task_env: Vec<(String, String)>,
     extra_vars: Option<IndexMap<String, String>>,
+}
+
+/// Format a task path for a child process without leaking the mixture of `/` and `\` that
+/// `PathBuf` preserves when a Windows root is joined to a multi-component config pattern.
+///
+/// Extended-length paths are exempt: `/` is an ordinary character after the `\\?\` prefix, so
+/// rewriting it there could change which file the value names. Unix paths are returned unchanged.
+fn task_env_path(path: &Path) -> String {
+    let path = path.display().to_string();
+    #[cfg(windows)]
+    {
+        if path.starts_with(r"\\?\") {
+            path
+        } else {
+            path.replace('/', "\\")
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -175,6 +200,41 @@ enum InlineArgsStyle {
     SeparateArgv,
 }
 
+/// Whether the shell mise is about to spawn cannot use `dir` as its working directory.
+///
+/// cmd.exe refuses a UNC working directory. It says so on stderr, starts in `C:\Windows` instead,
+/// and carries on — so the task runs somewhere the user never asked for while mise reports success.
+/// Reuses [`crate::path::is_cmd_shell_program`] and [`crate::file::is_unc_path`]; both already know
+/// the shapes involved, including `cmd`/`cmd.exe`/`CMD.EXE` and the verbatim `\\?\UNC\` form.
+#[cfg(windows)]
+fn cmd_shell_cannot_use_dir(program: &str, dir: &Path) -> bool {
+    crate::path::is_cmd_shell_program(Path::new(program)) && crate::file::is_unc_path(dir)
+}
+
+/// What to say when it cannot. Names both ways out, because neither setting is guessable.
+#[cfg(windows)]
+fn unc_working_dir_error(dir: &Path) -> String {
+    formatdoc! {r#"
+        cmd.exe cannot use a UNC path as a working directory
+
+          working directory: {dir}
+
+        It would start in C:\Windows instead and run the command there, so mise stops rather
+        than running it somewhere you did not ask for.
+
+        Use a shell that accepts UNC paths, either for this task:
+
+          shell = "pwsh -c"
+
+        or for every task:
+
+          mise settings windows_default_inline_shell_args="pwsh -c"
+
+        A file task takes its shell from windows_default_file_shell_args instead."#,
+        dir = display_path(dir),
+    }
+}
+
 fn inline_args_style(program: &str, shell_args: &[String]) -> InlineArgsStyle {
     #[cfg(windows)]
     {
@@ -211,7 +271,7 @@ fn append_inline_args(script: &str, args: &[String], style: InlineArgsStyle) -> 
 }
 
 /// Configuration for TaskExecutor
-pub struct TaskExecutorConfig {
+pub(crate) struct TaskExecutorConfig {
     pub force: bool,
     pub cd: Option<PathBuf>,
     pub shell: Option<String>,
@@ -229,7 +289,7 @@ pub struct TaskExecutorConfig {
 }
 
 /// Executes tasks with proper context, environment, and output handling
-pub struct TaskExecutor {
+pub(crate) struct TaskExecutor {
     pub context_builder: TaskContextBuilder,
     pub output_handler: OutputHandler,
     pub failed_tasks: FailedTasks,
@@ -253,7 +313,7 @@ pub struct TaskExecutor {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TaskRunOutcome {
+pub(crate) struct TaskRunOutcome {
     pub did_work: bool,
     pub cache_key: Option<String>,
 }
@@ -279,7 +339,7 @@ impl TaskCacheStats {
 }
 
 impl TaskExecutor {
-    pub fn new(
+    pub(crate) fn new(
         context_builder: TaskContextBuilder,
         output_handler: OutputHandler,
         config: TaskExecutorConfig,
@@ -306,15 +366,15 @@ impl TaskExecutor {
         }
     }
 
-    pub fn is_stopping(&self) -> bool {
+    pub(crate) fn is_stopping(&self) -> bool {
         self.is_interrupted() || !self.failed_tasks.lock().unwrap().is_empty()
     }
 
-    pub fn is_interrupted(&self) -> bool {
+    pub(crate) fn is_interrupted(&self) -> bool {
         self.interrupted.load(Ordering::Relaxed)
     }
 
-    pub fn mark_interrupted(&self) {
+    pub(crate) fn mark_interrupted(&self) {
         self.interrupted.store(true, Ordering::Relaxed);
     }
 
@@ -325,7 +385,7 @@ impl TaskExecutor {
         Ok(())
     }
 
-    pub fn add_failed_task(&self, task: Task, status: Option<i32>) {
+    pub(crate) fn add_failed_task(&self, task: Task, status: Option<i32>) {
         let mut failed = self.failed_tasks.lock().unwrap();
         failed.push((task, status.or(Some(1))));
     }
@@ -418,6 +478,8 @@ impl TaskExecutor {
                     "MISE_CACHE_SOCKET".into(),
                     "MISE_CACHE_STAGING_DIR".into(),
                     "MISE_CACHE_TASK".into(),
+                    "MISE_CACHE_CARGO_TARGET_DIR".into(),
+                    "MISE_CACHE_TASK_ROOT".into(),
                     "MISE_CACHE_RUST_VERIFY".into(),
                     "MISE_CACHE_PREVIOUS_RUSTC_WRAPPER".into(),
                     "RUSTC_WRAPPER".into(),
@@ -429,7 +491,7 @@ impl TaskExecutor {
         Ok(sandbox)
     }
 
-    pub fn task_timings(&self, task: Option<&Task>) -> bool {
+    pub(crate) fn task_timings(&self, task: Option<&Task>) -> bool {
         // Resolve the style/verbosity for *this* task so a per-task `output`
         // override is honored (e.g. a task with `output = "interleave"` must not
         // get a timing line just because the global default is `prefix`).
@@ -446,7 +508,7 @@ impl TaskExecutor {
 
     /// Run a task, returning whether it did work and any stable artifact identity
     /// it produced or reused.
-    pub async fn run_task_sched(&self, ctx: TaskRunContext<'_>) -> Result<TaskRunOutcome> {
+    pub(crate) async fn run_task_sched(&self, ctx: TaskRunContext<'_>) -> Result<TaskRunOutcome> {
         let TaskRunContext {
             task,
             config,
@@ -649,8 +711,12 @@ impl TaskExecutor {
             .as_ref()
             .filter(|_| self.task_cache.writes())
             .map(|_| Arc::new(StdMutex::new(Vec::new())));
-        let action_cache_run = if let Some(session) = self.cache_session.as_ref() {
-            session.apply(task, &mut env).await
+        let action_cache_run = if task.rust_cache.as_ref().is_some_and(|cache| cache.enabled)
+            && let Some(session) = self.cache_session.as_ref()
+        {
+            let task_cwd = task_cwd(task, config).await?;
+            let task_root = canonicalize_or_self(&task_source_match_root(&task_cwd, config));
+            session.apply(task, &task_root, &mut env).await
         } else {
             None
         };
@@ -1308,6 +1374,16 @@ impl TaskExecutor {
             }
             let (program, args, cmd_verbatim) =
                 self.get_cmd_program_and_args(command, task, &[])?;
+            // The same refusal as in `exec_program`, and it matters more here: these commands feed
+            // the cache key, so running them from C:\Windows would hash the wrong directory's
+            // answer. Measured on 2026.8.6 with the project on a UNC share — a `command_inputs`
+            // entry reading a file that exists in the project fails, while the same config on a
+            // local path succeeds. `--dry-run` does not reach here (see the cache branch in
+            // `run_task`), so there is nothing to exempt.
+            #[cfg(windows)]
+            if cmd_shell_cannot_use_dir(&program, &root) {
+                eyre::bail!("{}", unc_working_dir_error(&root));
+            }
             #[cfg(not(windows))]
             let _ = cmd_verbatim;
             let program = program.to_executable();
@@ -1423,6 +1499,12 @@ impl TaskExecutor {
         } = ctx;
         #[cfg(not(windows))]
         let _ = cmd_verbatim;
+        // `program` is shadowed several times below — `to_executable`, POSIX-shell resolution,
+        // audit wrapping — so keep the shell mise was asked to spawn for the working-directory
+        // check further down. `cmd_verbatim` is not a substitute: it is only set for inline
+        // scripts, and a file task can reach cmd.exe through windows_default_file_shell_args.
+        #[cfg(windows)]
+        let requested_program = program.to_string();
         let config = Config::get().await?;
         let program = program.to_executable();
         let redactions = config.redactions();
@@ -1672,6 +1754,12 @@ impl TaskExecutor {
                 ),
             );
         }
+        // Not under `--dry-run`: nothing is spawned there, so a preview of what *would* run has no
+        // reason to fail on where it would have run.
+        #[cfg(windows)]
+        if !self.dry_run && cmd_shell_cannot_use_dir(&requested_program, &dir) {
+            eyre::bail!("{}", unc_working_dir_error(&dir));
+        }
         cmd = cmd.current_dir(dir);
         if self.dry_run {
             return Ok(());
@@ -1773,7 +1861,11 @@ impl TaskExecutor {
     /// Validate a task invocation before the scheduler starts any task commands.
     /// Runtime execution repeats this work so configuration changes made while
     /// dependencies run are still detected.
-    pub async fn preflight_task_usage(&self, config: &Arc<Config>, task: &Task) -> Result<()> {
+    pub(crate) async fn preflight_task_usage(
+        &self,
+        config: &Arc<Config>,
+        task: &Task,
+    ) -> Result<()> {
         if task.should_bypass_usage_parser() {
             return Ok(());
         }
@@ -1987,7 +2079,7 @@ impl TaskExecutor {
                 &mut env,
                 &mut nested_mise_diff_exclude_keys,
                 "MISE_ORIGINAL_CWD",
-                cwd.display().to_string(),
+                task_env_path(cwd),
             );
         }
 
@@ -2003,7 +2095,7 @@ impl TaskExecutor {
                 &mut env,
                 &mut nested_mise_diff_exclude_keys,
                 "MISE_PROJECT_ROOT",
-                root.display().to_string(),
+                task_env_path(&root),
             );
         }
         if let Some(monorepo_root) = config.monorepo_root() {
@@ -2011,7 +2103,7 @@ impl TaskExecutor {
                 &mut env,
                 &mut nested_mise_diff_exclude_keys,
                 "MISE_MONOREPO_ROOT",
-                monorepo_root.display().to_string(),
+                task_env_path(&monorepo_root),
             );
         }
         Self::insert_env_excluded_from_nested_mise_diff(
@@ -2019,6 +2111,13 @@ impl TaskExecutor {
             &mut nested_mise_diff_exclude_keys,
             "MISE_TASK_NAME",
             task.name.clone(),
+        );
+        let task_color = self.output_handler.task_prefix_color(task);
+        Self::insert_env_excluded_from_nested_mise_diff(
+            &mut env,
+            &mut nested_mise_diff_exclude_keys,
+            "MISE_TASK_COLOR",
+            task_color,
         );
         let task_file = task
             .file_path(config)
@@ -2028,14 +2127,14 @@ impl TaskExecutor {
             &mut env,
             &mut nested_mise_diff_exclude_keys,
             "MISE_TASK_FILE",
-            task_file.display().to_string(),
+            task_env_path(&task_file),
         );
         if let Some(dir) = task_file.parent() {
             Self::insert_env_excluded_from_nested_mise_diff(
                 &mut env,
                 &mut nested_mise_diff_exclude_keys,
                 "MISE_TASK_DIR",
-                dir.display().to_string(),
+                task_env_path(dir),
             );
         }
         if let Some(config_root) = &task.config_root {
@@ -2043,7 +2142,7 @@ impl TaskExecutor {
                 &mut env,
                 &mut nested_mise_diff_exclude_keys,
                 "MISE_CONFIG_ROOT",
-                config_root.display().to_string(),
+                task_env_path(config_root),
             );
         }
         if Settings::get().env_cache {
@@ -2318,6 +2417,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn task_env_path_preserves_host_path_spelling() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                task_env_path(Path::new(r"C:\Users\me\.config/mise/config.toml")),
+                r"C:\Users\me\.config\mise\config.toml"
+            );
+            assert_eq!(
+                task_env_path(Path::new(r"\\server\share/tasks/build.ps1")),
+                r"\\server\share\tasks\build.ps1"
+            );
+            // Within an extended-length path `/` is data, not a separator.
+            assert_eq!(
+                task_env_path(Path::new(r"\\?\C:\tasks/a/b")),
+                r"\\?\C:\tasks/a/b"
+            );
+        }
+        #[cfg(not(windows))]
+        assert_eq!(
+            task_env_path(Path::new(r"/tmp/tasks\build")),
+            r"/tmp/tasks\build"
+        );
+    }
+
+    #[test]
     fn task_cache_stats_saturate_and_accumulate() {
         let mut stats = TaskCacheStats::default();
         stats.record_miss();
@@ -2370,14 +2494,28 @@ mod tests {
         // the machine's file association points at, where `wscript` writes to message boxes
         // instead of the pipes mise reads.
         //
-        // Iterating the list is the point. `shell_from_extension` cannot match against it
-        // directly because that function is not cfg(windows)-gated while the list is, so
-        // adding an entry there without a mapping here would otherwise go unnoticed.
-        for ext in crate::file::INTERPRETER_ONLY_EXTENSIONS {
+        // Derived from the setting rather than from a hand-kept list of interpreter-only
+        // extensions, so that adding one to the shipped default without a mapping here is caught
+        // too. `shell_from_extension` cannot do the check itself: it is not cfg(windows)-gated
+        // while `os_can_launch_extension` is.
+        let needs_interpreter: Vec<String> = Settings::get()
+            .windows_executable_extensions
+            .iter()
+            .filter(|ext| !crate::file::os_can_launch_extension(ext))
+            .cloned()
+            .collect();
+        // Guards the loop below against passing vacuously if the two lists ever stop overlapping.
+        assert!(
+            !needs_interpreter.is_empty(),
+            "expected the default windows_executable_extensions to include extensions the OS \
+             cannot launch (ps1, vbs)"
+        );
+        for ext in needs_interpreter {
             let path = PathBuf::from(format!("task.{ext}"));
             assert!(
                 shell_from_extension(&path).is_some(),
-                "{ext} is rejected as interpreter-only but has no interpreter mapping"
+                "{ext} is executable per settings but the OS cannot launch it, and it has no \
+                 interpreter mapping"
             );
         }
         // The console host specifically, and case-insensitively.
@@ -2678,5 +2816,47 @@ mod tests {
         let env = env_with_path("/usr/bin:/bin");
         let out = maybe_convert_env_for_msys_shell(Path::new("bash"), &env);
         assert_eq!(out.get(&*crate::env::PATH_KEY).unwrap(), "/usr/bin:/bin");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cmd_will_not_take_a_unc_working_directory() {
+        // Measured on 2026.8.6 against \\wsl.localhost\<distro>\...: `cmd /c cd` printed
+        // C:\Windows and the task still reported success, so the spawn has to be refused.
+        assert!(cmd_shell_cannot_use_dir(
+            "cmd.exe",
+            Path::new(r"\\server\share\proj")
+        ));
+        // The verbatim form std hands back from canonicalize names the same directory.
+        assert!(cmd_shell_cannot_use_dir(
+            "cmd.exe",
+            Path::new(r"\\?\UNC\server\share\proj")
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn another_shell_on_the_same_unc_directory_is_left_alone() {
+        // Control: pwsh runs in that directory correctly, so the shell is half of the decision.
+        assert!(!cmd_shell_cannot_use_dir(
+            "pwsh",
+            Path::new(r"\\server\share\proj")
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cmd_on_an_ordinary_directory_is_left_alone() {
+        // Control: the UNC shape is the other half. cmd is fine everywhere else.
+        assert!(!cmd_shell_cannot_use_dir("cmd.exe", Path::new(r"C:\proj")));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_error_names_the_directory_and_a_way_out() {
+        let msg = unc_working_dir_error(Path::new(r"\\server\share\proj"));
+        assert!(msg.contains(r"\\server\share\proj"), "{msg}");
+        assert!(msg.contains("pwsh -c"), "{msg}");
+        assert!(msg.contains("windows_default_inline_shell_args"), "{msg}");
     }
 }

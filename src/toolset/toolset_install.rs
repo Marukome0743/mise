@@ -4,6 +4,7 @@ use std::sync::Arc;
 use eyre::Result;
 use indexmap::IndexSet;
 use itertools::Itertools;
+use tokio::sync::OnceCell;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 
@@ -25,7 +26,7 @@ use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::{backend, config, hooks, runtime_symlinks};
 
 impl Toolset {
-    pub async fn should_install_missing_registry_bin_provider(
+    pub(crate) async fn should_install_missing_registry_bin_provider(
         &self,
         config: &Arc<Config>,
         bin_name: &str,
@@ -125,21 +126,27 @@ impl Toolset {
     pub(super) fn init_request_options(&self, requests: &mut Vec<ToolRequest>) {
         for tr in requests {
             if let Some(tvl) = self.versions.get(tr.ba()) {
-                if tvl.requests.len() != 1 {
-                    // TODO: handle this case with multiple versions
+                // Requests cloned from this toolset already carry their own
+                // per-entry options, including platform filters. Do not
+                // collapse duplicate selectors onto another config entry.
+                if tvl.requests.contains(tr) {
                     continue;
                 }
-                // Use config request options if available, falling back to backend arg opts.
-                // This ensures tool options like postinstall from mise.toml are preserved
-                // when installing with an explicit CLI version (e.g. `mise install tool@latest`).
-                let config_options = tvl
-                    .requests
-                    .first()
-                    .map(|r| r.options())
-                    .filter(|opts| !opts.is_empty());
-                let options = tr.ba().opts_with_config(config_options);
-                if tr.options().is_empty() || tr.options() != options {
-                    tr.set_options(options);
+                // Use matching config options when available. If selection is
+                // ambiguous, preserve options already carried by the request;
+                // synthesize backend defaults only for an empty request.
+                if let Some(config_options) =
+                    super::tool_request_set::configured_options_for_runtime_request(
+                        &tvl.requests,
+                        tr,
+                    )
+                {
+                    let options = tr.ba().opts_with_config(Some(config_options));
+                    if tr.options() != options {
+                        tr.set_options(options);
+                    }
+                } else if tr.options().is_empty() {
+                    tr.set_options(tr.ba().opts_with_config(None));
                 }
             }
         }
@@ -161,6 +168,7 @@ impl Toolset {
 
         self.init_request_options(&mut versions);
         ensure_compatible_install_requests(&versions)?;
+        ensure_safe_install_options(&versions)?;
 
         // Validate shared install destinations before plugin installation or
         // hooks introduce side effects.
@@ -175,7 +183,16 @@ impl Toolset {
         };
         mpr.init_footer(opts.dry_run, &footer_reason, versions.len());
 
-        hooks::run_one_hook(config, self, Hooks::Preinstall, None, opts.dry_run).await;
+        hooks::run_one_hook_with_context(
+            config,
+            self,
+            Hooks::Preinstall,
+            None,
+            None,
+            opts.dry_run,
+            opts.global_hooks_only,
+        )
+        .await;
 
         show_python_install_hint(&versions);
 
@@ -280,6 +297,7 @@ impl Toolset {
                 None,
                 None,
                 opts.dry_run,
+                opts.global_hooks_only,
             )
             .await;
         } else {
@@ -296,6 +314,7 @@ impl Toolset {
                 None,
                 Some(&installed_tools),
                 opts.dry_run,
+                opts.global_hooks_only,
             )
             .await;
         }
@@ -567,12 +586,13 @@ impl Toolset {
             dry_run: opts.dry_run,
             locked: opts.locked || config.tool_config_locked(tr.source()),
             before_date,
+            dependency_context: OnceCell::new(),
         };
 
         backend.install_version(ctx, tv).await
     }
 
-    pub async fn install_missing_bin(
+    pub(crate) async fn install_missing_bin(
         &mut self,
         config: &mut Arc<Config>,
         bin_name: &str,
@@ -669,7 +689,7 @@ impl Toolset {
     }
 
     /// Install all plugins defined in [plugins] config section
-    pub async fn ensure_config_plugins_installed(
+    pub(crate) async fn ensure_config_plugins_installed(
         config: &Arc<Config>,
         dry_run: bool,
     ) -> Result<()> {
@@ -677,7 +697,7 @@ impl Toolset {
     }
 
     /// Install all plugins from an explicit plugin URL map.
-    pub async fn ensure_config_plugins_installed_from_urls(
+    pub(crate) async fn ensure_config_plugins_installed_from_urls(
         config: &Arc<Config>,
         repo_urls: &HashMap<String, String>,
         dry_run: bool,
@@ -712,6 +732,13 @@ impl Toolset {
     fn parse_plugin_key(key: &str) -> (PluginType, &str) {
         PluginType::from_plugin_config(key)
     }
+}
+
+fn ensure_safe_install_options(versions: &[ToolRequest]) -> Result<()> {
+    for request in versions {
+        request.ensure_safe_install_options()?;
+    }
+    Ok(())
 }
 
 /// Whether install-time resolution should refresh the remote-versions cache
@@ -758,5 +785,70 @@ fn transitive_dependency_before_date(
         }
         ToolRequest::Ref { .. } | ToolRequest::Path { .. } | ToolRequest::System { .. } => None,
         _ => tv.before_date,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::args::BackendArg;
+    use crate::toolset::parse_tool_options;
+
+    #[tokio::test]
+    async fn test_init_request_options_preserves_unmatched_request_options() {
+        crate::toolset::install_state::init().await.unwrap();
+        let ba = Arc::new(BackendArg::from("dummy"));
+        let mut toolset = Toolset::new(ToolSource::Unknown);
+        for version in ["1.0.0", "2.0.0"] {
+            toolset.add_version(
+                ToolRequest::new_opts(
+                    ba.clone(),
+                    version,
+                    parse_tool_options(&format!(r#"postinstall="echo configured {version}""#)),
+                    ToolSource::Unknown,
+                )
+                .unwrap(),
+            );
+        }
+
+        let mut requests = vec![
+            ToolRequest::new_opts(
+                ba.clone(),
+                "3.0.0",
+                parse_tool_options(r#"postinstall="echo carried""#),
+                ToolSource::Argument,
+            )
+            .unwrap(),
+        ];
+        toolset.init_request_options(&mut requests);
+
+        assert_eq!(
+            requests[0].options().get("postinstall"),
+            Some("echo carried")
+        );
+
+        let mut inactive_options = parse_tool_options(r#"postinstall="echo inactive""#);
+        let inactive_os = match crate::cli::version::OS.as_str() {
+            "linux" => "macos",
+            _ => "linux",
+        };
+        inactive_options.core.os = Some(vec![inactive_os.to_string()]);
+        let inactive =
+            ToolRequest::new_opts(ba.clone(), "4.0.0", inactive_options, ToolSource::Unknown)
+                .unwrap();
+        let active = ToolRequest::new_opts(
+            ba,
+            "4.0.0",
+            parse_tool_options(r#"postinstall="echo active""#),
+            ToolSource::Unknown,
+        )
+        .unwrap();
+        let mut toolset = Toolset::new(ToolSource::Unknown);
+        toolset.add_version(inactive.clone());
+        toolset.add_version(active.clone());
+        let mut requests = vec![inactive.clone(), active.clone()];
+        toolset.init_request_options(&mut requests);
+
+        assert_eq!(requests, vec![inactive, active]);
     }
 }

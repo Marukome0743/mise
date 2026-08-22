@@ -5,7 +5,7 @@ use indoc::formatdoc;
 use crate::cli::args::ToolArg;
 use crate::config::Config;
 use crate::env;
-use crate::shell::get_shell;
+use crate::shell::{EXAMPLE_SHELL, require_shell};
 use crate::toolset::{InstallOptions, ToolSource, ToolsetBuilder, tool_env_var_name};
 
 /// Sets a tool version for the current session.
@@ -16,7 +16,7 @@ use crate::toolset::{InstallOptions, ToolSource, ToolsetBuilder, tool_env_var_na
 /// such as `MISE_NODE_VERSION=20` which is "eval"ed as a shell function created by `mise activate`.
 #[derive(Debug, clap::Args)]
 #[clap(verbatim_doc_comment, visible_alias = "sh", after_long_help = AFTER_LONG_HELP)]
-pub struct Shell {
+pub(crate) struct Shell {
     /// Tool(s) to use
     #[clap(value_name = "TOOL@VERSION", required = true)]
     tool: Vec<ToolArg>,
@@ -38,13 +38,16 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub async fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         let mut config = Config::get().await?;
         if !env::is_activated() {
             err_inactive()?;
         }
 
-        let shell = get_shell(None).expect("no shell detected");
+        let shell = require_shell(
+            None,
+            &format!("Re-run `mise activate {EXAMPLE_SHELL}` in your shell rc file."),
+        )?;
 
         if self.unset {
             for ta in &self.tool {

@@ -28,12 +28,12 @@ use tempfile::tempdir_in;
 const SWIFT_PLATFORM_OPTION: &str = "swift_platform";
 
 #[derive(Debug)]
-pub struct SwiftPlugin {
+pub(super) struct SwiftPlugin {
     ba: Arc<BackendArg>,
 }
 
 impl SwiftPlugin {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             ba: Arc::new(plugins::core::new_backend_arg("swift")),
         }
@@ -448,7 +448,7 @@ mod lockfile_tests {
     /// Pin `swift.platform` so the assertions don't depend on the distro the
     /// tests happen to run on.
     fn pin_platform(platform: Option<&str>) -> SettingsResetGuard {
-        let lock = TEST_SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = crate::test::lock_ignoring_poison(&TEST_SETTINGS_LOCK);
         let guard = SettingsResetGuard { _lock: lock };
         let mut settings = SettingsPartial::empty();
         settings.swift.platform = platform.map(str::to_string);

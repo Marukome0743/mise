@@ -360,7 +360,7 @@ fn replace_tool_entries_preserving_position(
 }
 
 #[derive(Default, Deserialize)]
-pub struct MiseToml {
+pub(crate) struct MiseToml {
     #[serde(rename = "_")]
     custom: Option<toml::Value>,
     #[serde(default, deserialize_with = "deserialize_min_version")]
@@ -427,10 +427,10 @@ pub struct MiseToml {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct MiseTomlToolList(Vec<MiseTomlTool>);
+pub(crate) struct MiseTomlToolList(Vec<MiseTomlTool>);
 
 #[derive(Debug, Clone)]
-pub struct MiseTomlTool {
+pub(crate) struct MiseTomlTool {
     /// The version request exactly as written, still un-rendered.
     ///
     /// Deliberately not parsed into a [`ToolVersionType`] here: a `:` inside a template belongs to
@@ -461,17 +461,17 @@ where
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct Tasks(pub BTreeMap<String, Task>);
+pub(crate) struct Tasks(pub BTreeMap<String, Task>);
 
 #[derive(Debug, Default, Clone)]
-pub struct TaskTemplates(pub IndexMap<String, TaskTemplate>);
+pub(crate) struct TaskTemplates(pub IndexMap<String, TaskTemplate>);
 
 #[derive(Debug, Default, Clone)]
-pub struct EnvList(pub(crate) Vec<EnvDirective>);
+pub(crate) struct EnvList(pub(crate) Vec<EnvDirective>);
 
 /// Configuration for the [monorepo] section in mise.toml.
 #[derive(Debug, Default, Clone, Deserialize)]
-pub struct MonorepoConfig {
+pub(crate) struct MonorepoConfig {
     /// Explicit list of config roots for monorepo task discovery.
     /// Supports single-level glob patterns (*).
     #[serde(default)]
@@ -490,7 +490,7 @@ pub struct MonorepoConfig {
 }
 
 impl EnvList {
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
@@ -524,7 +524,7 @@ impl MiseToml {
         }
         Ok(())
     }
-    pub fn init(path: &Path) -> Self {
+    pub(crate) fn init(path: &Path) -> Self {
         let mut context = BASE_CONTEXT.clone();
         context.insert(
             "config_root",
@@ -539,12 +539,12 @@ impl MiseToml {
         rf
     }
 
-    pub fn from_file(path: &Path) -> eyre::Result<Self> {
+    pub(crate) fn from_file(path: &Path) -> eyre::Result<Self> {
         let body = file::read_to_string(path)?;
         Self::from_str(&body, path)
     }
 
-    pub fn from_str(body: &str, path: &Path) -> eyre::Result<Self> {
+    pub(crate) fn from_str(body: &str, path: &Path) -> eyre::Result<Self> {
         if !Self::is_trust_exempt(body, path) {
             trust_check(path)?;
         }
@@ -589,7 +589,7 @@ impl MiseToml {
     /// Whether the config file at `path` loads without trust (see
     /// [`Self::is_trust_exempt`]). Returns false for unreadable files and for
     /// non-mise.toml files (e.g. `.tool-versions`), which have their own flow.
-    pub fn path_is_trust_exempt(path: &Path) -> bool {
+    pub(crate) fn path_is_trust_exempt(path: &Path) -> bool {
         file::read_to_string(path).is_ok_and(|body| Self::is_trust_exempt(&body, path))
     }
 
@@ -658,7 +658,7 @@ impl MiseToml {
         Ok(self.doc.lock().unwrap())
     }
 
-    pub fn set_backend_alias(&mut self, fa: &BackendArg, to: &str) -> eyre::Result<()> {
+    pub(crate) fn set_backend_alias(&mut self, fa: &BackendArg, to: &str) -> eyre::Result<()> {
         self.doc_mut()?
             .get_mut()
             .unwrap()
@@ -670,7 +670,7 @@ impl MiseToml {
         Ok(())
     }
 
-    pub fn set_alias(&mut self, fa: &BackendArg, from: &str, to: &str) -> eyre::Result<()> {
+    pub(crate) fn set_alias(&mut self, fa: &BackendArg, from: &str, to: &str) -> eyre::Result<()> {
         self.tool_alias
             .entry(fa.short.to_string())
             .or_default()
@@ -694,7 +694,7 @@ impl MiseToml {
         Ok(())
     }
 
-    pub fn remove_backend_alias(&mut self, fa: &BackendArg) -> eyre::Result<()> {
+    pub(crate) fn remove_backend_alias(&mut self, fa: &BackendArg) -> eyre::Result<()> {
         let mut doc = self.doc_mut()?;
         let doc = doc.get_mut().unwrap();
         // Remove from both tool_alias and deprecated alias sections
@@ -709,7 +709,7 @@ impl MiseToml {
         Ok(())
     }
 
-    pub fn remove_alias(&mut self, fa: &BackendArg, from: &str) -> eyre::Result<()> {
+    pub(crate) fn remove_alias(&mut self, fa: &BackendArg, from: &str) -> eyre::Result<()> {
         // Remove from both tool_alias and deprecated alias in memory
         for alias_map in [&mut self.tool_alias, &mut self.alias] {
             if let Some(aliases) = alias_map.get_mut(&fa.short) {
@@ -747,7 +747,7 @@ impl MiseToml {
         Ok(())
     }
 
-    pub fn set_shell_alias(&mut self, name: &str, command: &str) -> eyre::Result<()> {
+    pub(crate) fn set_shell_alias(&mut self, name: &str, command: &str) -> eyre::Result<()> {
         self.shell_alias.insert(name.into(), command.into());
         let mut doc = self.doc_mut()?;
         let shell_alias = doc
@@ -759,7 +759,7 @@ impl MiseToml {
         Ok(())
     }
 
-    pub fn remove_shell_alias(&mut self, name: &str) -> eyre::Result<()> {
+    pub(crate) fn remove_shell_alias(&mut self, name: &str) -> eyre::Result<()> {
         self.shell_alias.shift_remove(name);
         let mut doc = self.doc_mut()?;
         let doc = doc.get_mut().unwrap();
@@ -772,7 +772,7 @@ impl MiseToml {
         Ok(())
     }
 
-    pub fn update_env<V: Into<Value>>(&mut self, key: &str, value: V) -> eyre::Result<()> {
+    pub(crate) fn update_env<V: Into<Value>>(&mut self, key: &str, value: V) -> eyre::Result<()> {
         let mut doc = self.doc_mut()?;
         let mut env_tbl = doc
             .get_mut()
@@ -800,7 +800,11 @@ impl MiseToml {
 
     /// Set `[bootstrap.packages]."<manager>:<package>" = "<version>"`,
     /// creating the tables as needed ("latest" means no pin)
-    pub fn update_bootstrap_package(&mut self, spec: &str, version: &str) -> eyre::Result<()> {
+    pub(crate) fn update_bootstrap_package(
+        &mut self,
+        spec: &str,
+        version: &str,
+    ) -> eyre::Result<()> {
         let packages = &mut self.bootstrap.get_or_insert_with(Default::default).packages;
         let preserve_options = match packages.get_mut(spec) {
             Some(PackageTomlConfig::Options(options)) => {
@@ -850,7 +854,7 @@ impl MiseToml {
 
     /// Update a package while inheriting table-form options when this file does not declare it.
     #[cfg(unix)]
-    pub fn update_bootstrap_package_with_fallback(
+    pub(crate) fn update_bootstrap_package_with_fallback(
         &mut self,
         spec: &str,
         version: &str,
@@ -862,7 +866,7 @@ impl MiseToml {
             .is_none_or(|bootstrap| !bootstrap.packages.contains_key(spec));
         if is_missing
             && let Some(PackageTomlConfig::Options(options)) = fallback
-            && !options.os.is_empty()
+            && (!options.os.is_empty() || options.adopt.is_some())
         {
             let mut options = options.clone();
             options.version = version.to_string();
@@ -890,9 +894,14 @@ impl MiseToml {
                 .unwrap();
             let mut value = InlineTable::new();
             value.insert("version", Value::from(version));
-            let mut os = Array::new();
-            os.extend(options.os);
-            value.insert("os", Value::Array(os));
+            if !options.os.is_empty() {
+                let mut os = Array::new();
+                os.extend(options.os);
+                value.insert("os", Value::Array(os));
+            }
+            if let Some(adopt) = options.adopt {
+                value.insert("adopt", Value::from(adopt));
+            }
             packages.insert(spec, Item::Value(Value::InlineTable(value)));
             return Ok(());
         }
@@ -902,7 +911,7 @@ impl MiseToml {
     /// Set `[bootstrap.brew.taps]."<owner>/<tap>" = "<url>"`, creating the
     /// tables as needed. Only used by the `#[cfg(unix)]` brew CLI commands.
     #[cfg(unix)]
-    pub fn update_bootstrap_brew_tap(&mut self, tap: &str, url: &str) -> eyre::Result<()> {
+    pub(crate) fn update_bootstrap_brew_tap(&mut self, tap: &str, url: &str) -> eyre::Result<()> {
         self.bootstrap
             .get_or_insert_with(Default::default)
             .brew
@@ -937,7 +946,7 @@ impl MiseToml {
     }
 
     #[cfg(unix)]
-    pub fn remove_bootstrap_brew_tap(&mut self, tap: &str) -> eyre::Result<()> {
+    pub(crate) fn remove_bootstrap_brew_tap(&mut self, tap: &str) -> eyre::Result<()> {
         if let Some(bootstrap) = &mut self.bootstrap {
             bootstrap.brew.taps.shift_remove(tap);
         }
@@ -961,7 +970,7 @@ impl MiseToml {
         Ok(())
     }
 
-    pub fn update_env_age(
+    pub(crate) fn update_env_age(
         &mut self,
         key: &str,
         value: &str,
@@ -1011,7 +1020,7 @@ impl MiseToml {
         Ok(())
     }
 
-    pub fn remove_env(&mut self, key: &str) -> eyre::Result<()> {
+    pub(crate) fn remove_env(&mut self, key: &str) -> eyre::Result<()> {
         let mut doc = self.doc_mut()?;
         let env_tbl = doc
             .get_mut()
@@ -3282,9 +3291,12 @@ mod tests {
         "apt:libssl-dev" = "latest"
         "apt:curl" = "8.5.0-2"
         "brew:postgresql@17" = "latest"
-        "brew-cask:1password" = { version = "latest", os = "macos" }
+        "brew-cask:1password" = { version = "latest", os = "macos", adopt = true }
         "brew-cask:font-example" = { os = ["linux", "macos"] }
         "future-manager:whatever" = "latest"
+
+        [bootstrap.brew]
+        adopt = true
 
         [bootstrap.brew.taps]
         "railwaycat/emacsmacport" = "https://github.com/railwaycat/homebrew-emacsmacport"
@@ -3306,6 +3318,10 @@ mod tests {
             system.packages.get("apt:libssl-dev").unwrap().version(),
             "latest"
         );
+        assert!(matches!(
+            system.packages.get("brew-cask:1password"),
+            Some(crate::system::PackageTomlConfig::Options(options)) if options.adopt == Some(true)
+        ));
         assert_eq!(
             system.packages.get("apt:curl").unwrap().version(),
             "8.5.0-2"
@@ -3334,6 +3350,7 @@ mod tests {
             system.brew.taps.get("railwaycat/emacsmacport").unwrap(),
             "https://github.com/railwaycat/homebrew-emacsmacport"
         );
+        assert_eq!(system.brew.adopt, Some(true));
         let repo = system.repos.get("~/src/dotfiles").unwrap();
         assert_eq!(
             repo.url.as_deref(),
@@ -3358,6 +3375,21 @@ mod tests {
         let cf = MiseToml::from_file(&p).unwrap();
         assert!(cf.bootstrap_config().is_none());
         file::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn test_bootstrap_brew_adopt_is_not_reported_as_unknown() {
+        let des = toml::Deserializer::parse(
+            r#"
+            [bootstrap.brew]
+            adopt = true
+            "#,
+        )
+        .unwrap();
+        let mut ignored = Vec::new();
+        let _: MiseToml = serde_ignored::deserialize(des, |path| ignored.push(path.to_string()))
+            .expect("config should deserialize");
+        assert!(ignored.is_empty(), "unexpected ignored fields: {ignored:?}");
     }
 
     #[tokio::test]
@@ -3609,6 +3641,7 @@ mod tests {
                     PackageTomlConfig::Options(crate::system::PackageOptionsTomlConfig {
                         version: "1.0.0".to_string(),
                         os: vec![],
+                        adopt: None,
                     });
                 cf.update_bootstrap_package_with_fallback(
                     "brew:tree",

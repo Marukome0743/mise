@@ -57,6 +57,8 @@ pub struct AquaPackage {
     pub repo_owner: String,
     pub repo_name: String,
     pub name: Option<String>,
+    #[serde(rename = "crate")]
+    pub crate_name: Option<String>,
     pub asset: String,
     pub url: String,
     pub description: Option<String>,
@@ -768,7 +770,7 @@ impl AquaPackage {
 
     /// Check if a version passes the version filter
     pub fn version_filter_ok(&self, v: &str) -> Result<bool> {
-        if let Some(filter) = self.version_filter_expr.clone() {
+        if let Some(filter) = &self.version_filter_expr {
             if let Value::Bool(expr) = self.expr(v, filter)? {
                 Ok(expr)
             } else {
@@ -783,7 +785,7 @@ impl AquaPackage {
         }
     }
 
-    fn expr(&self, v: &str, program: Program) -> Result<Value> {
+    fn expr(&self, v: &str, program: &Program) -> Result<Value> {
         let expr = self.expr_parser(v);
         expr.run(program, &self.expr_ctx(v)).map_err(|e| eyre!(e))
     }
@@ -1017,6 +1019,9 @@ fn apply_override(mut orig: AquaPackage, avo: &AquaPackage) -> AquaPackage {
     }
     if !avo.repo_name.is_empty() {
         orig.repo_name = avo.repo_name.clone();
+    }
+    if let Some(crate_name) = avo.crate_name.clone() {
+        orig.crate_name = Some(crate_name);
     }
     if !avo.asset.is_empty() {
         orig.asset = avo.asset.clone();
@@ -1561,6 +1566,25 @@ packages:
 
         assert_eq!(pkg.r#type, None);
         assert_eq!(pkg.package_type(), AquaPackageType::GithubRelease);
+    }
+
+    #[test]
+    fn test_cargo_crate_survives_version_override() {
+        let pkg = first_registry_package(
+            r#"
+packages:
+  - type: github_release
+    version_constraint: "false"
+    version_overrides:
+      - version_constraint: "true"
+        type: cargo
+        crate: example-crate
+"#,
+        )
+        .with_version(&["1.0.0"], "linux", "amd64");
+
+        assert_eq!(pkg.package_type(), AquaPackageType::Cargo);
+        assert_eq!(pkg.crate_name.as_deref(), Some("example-crate"));
     }
 
     #[test]

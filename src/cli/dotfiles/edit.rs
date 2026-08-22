@@ -12,7 +12,7 @@ use crate::ui::prompt;
 /// Edit a managed dotfile source
 #[derive(Debug, clap::Args)]
 #[clap(verbatim_doc_comment, after_long_help = AFTER_LONG_HELP)]
-pub struct DotfilesEdit {
+pub(crate) struct DotfilesEdit {
     /// Target to edit
     #[clap(value_name = "TARGET")]
     target: String,
@@ -35,7 +35,7 @@ pub struct DotfilesEdit {
 }
 
 impl DotfilesEdit {
-    pub async fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         let mut config = Config::get().await?;
         let target = system::files::resolve_target_arg(&self.target);
 
@@ -91,12 +91,12 @@ fn source_for_target(
     target: &std::path::Path,
     raw: &str,
 ) -> Result<Option<PathBuf>> {
-    for req in system::files::files_from_config(config) {
+    for req in system::files::files_from_config(config)? {
         if system::files::matches_target(&req.target, &req.target_raw, &[raw.to_string()]) {
             return Ok(Some(req.source));
         }
     }
-    let matching_edits = system::edits::edits_from_config(config)
+    let matching_edits = system::edits::edits_from_config(config)?
         .into_iter()
         .filter(|req| system::edits::matches_target(req, &[raw.to_string()]))
         .collect::<Vec<_>>();
@@ -143,11 +143,11 @@ fn open_or_create(path: &std::path::Path) -> Result<()> {
 async fn apply_target(target: &str) -> Result<()> {
     let config = Config::reset().await?;
     let targets = vec![target.to_string()];
-    let files = system::files::files_from_config(&config)
+    let files = system::files::files_from_config(&config)?
         .into_iter()
         .filter(|req| system::files::matches_target(&req.target, &req.target_raw, &targets))
         .collect::<Vec<_>>();
-    let edits = system::edits::edits_from_config(&config)
+    let edits = system::edits::edits_from_config(&config)?
         .into_iter()
         .filter(|req| system::edits::matches_target(req, &targets))
         .collect::<Vec<_>>();

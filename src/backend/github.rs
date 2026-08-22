@@ -30,7 +30,7 @@ use std::sync::Arc;
 use xx::regex;
 
 #[derive(Debug)]
-pub struct UnifiedGitBackend {
+pub(crate) struct UnifiedGitBackend {
     ba: Arc<BackendArg>,
 }
 
@@ -306,7 +306,7 @@ fn is_slsa_format_issue(e: &crate::github::sigstore::AttestationError) -> bool {
 }
 
 /// Returns install-time-only option keys for GitHub/GitLab backend.
-pub fn install_time_option_keys() -> Vec<String> {
+pub(crate) fn install_time_option_keys() -> Vec<String> {
     vec![
         "asset_pattern".into(),
         "additional_asset_patterns".into(),
@@ -933,7 +933,7 @@ impl Backend for UnifiedGitBackend {
 }
 
 impl UnifiedGitBackend {
-    pub fn from_arg(ba: BackendArg) -> Self {
+    pub(crate) fn from_arg(ba: BackendArg) -> Self {
         Self { ba: Arc::new(ba) }
     }
 
@@ -1170,9 +1170,9 @@ impl UnifiedGitBackend {
             asset.url_api.clone()
         };
         let headers = if self.is_gitlab() {
-            gitlab::get_headers(&download_url)
+            gitlab::get_headers(&download_url, &api_url)
         } else if self.is_forgejo() {
-            forgejo::get_headers(&download_url)
+            forgejo::get_headers(&download_url, &api_url)
         } else {
             github::get_headers(&download_url)?
         };
@@ -1413,9 +1413,9 @@ impl UnifiedGitBackend {
         };
 
         let headers = if self.is_gitlab() {
-            gitlab::get_headers(&url)
+            gitlab::get_headers(&url, &opts.api_url())
         } else if self.is_forgejo() {
-            forgejo::get_headers(&url)
+            forgejo::get_headers(&url, &opts.api_url())
         } else {
             github::get_headers(&url)?
         };
@@ -1520,9 +1520,9 @@ impl UnifiedGitBackend {
             asset.url_api.clone()
         };
         let headers = if self.is_gitlab() {
-            gitlab::get_headers(&url)
+            gitlab::get_headers(&url, &opts.api_url())
         } else if self.is_forgejo() {
-            forgejo::get_headers(&url)
+            forgejo::get_headers(&url, &opts.api_url())
         } else {
             github::get_headers(&url)?
         };

@@ -1,4 +1,4 @@
-pub use std::path::*;
+pub(crate) use std::path::*;
 
 use crate::dirs;
 
@@ -17,14 +17,57 @@ use crate::dirs;
 /// there would change identity, not presentation.
 ///
 /// Off Windows this returns its input: `\` is an ordinary filename character there.
-pub fn settle_display_separators(s: String) -> String {
+pub(crate) fn settle_display_separators(s: String) -> String {
     match cfg!(windows) {
         true => s.replace('/', "\\"),
         false => s,
     }
 }
 
-pub trait PathExt {
+/// `\\?\UNC\server\share\x` shown as `\\server\share\x`.
+///
+/// The half of the extended-length prefix `dunce::simplified` leaves behind: its
+/// `is_safe_to_strip_unc` accepts `Prefix::VerbatimDisk` and nothing else, so a UNC path keeps a
+/// prefix mise itself rejects as input. Verified reachable on `\\wsl.localhost\<distro>\…`, which
+/// resolves perfectly well without it.
+///
+/// Declines in the three cases where the plain form would not name the same file:
+///
+/// - **a `/` in the remainder.** Inside `\\?\` a `/` is an ordinary character, so `a/b` is one
+///   component; `\\server\share\a/b` is two. `display_path`'s tests already pin the same trap for
+///   the disk prefix.
+/// - **past `MAX_PATH`.** There the prefix is load-bearing after all.
+/// - **a component ending in `.` or a space.** Those only resolve through the verbatim form.
+///
+/// Reserved names are *not* checked, though `dunce` declines them. It is handing back paths to open;
+/// this is text to read, and a directory named `con` is addressable by its plain path — measured,
+/// along with a task whose `dir` was `con` running in the right place. The disk-prefix case is
+/// unaffected either way, since `dunce` has already declined it before this sees it.
+#[cfg(windows)]
+fn simplify_verbatim_unc(shown: String) -> String {
+    const VERBATIM_UNC: &str = r"\\?\UNC\";
+
+    let Some(rest) = shown.strip_prefix(VERBATIM_UNC) else {
+        return shown;
+    };
+    let plain_len = 2 + rest.encode_utf16().count();
+    if rest.contains('/')
+        || plain_len >= crate::file::MAX_PATH
+        || rest
+            .split('\\')
+            .any(|c| c.ends_with('.') || c.ends_with(' '))
+    {
+        return shown;
+    }
+    format!(r"\\{rest}")
+}
+
+#[cfg(not(windows))]
+fn simplify_verbatim_unc(shown: String) -> String {
+    shown
+}
+
+pub(crate) trait PathExt {
     /// replaces $HOME with "~", and drops a Windows extended-length prefix
     fn display_user(&self) -> String;
     fn mount(&self, on: &Path) -> PathBuf;
@@ -38,9 +81,12 @@ impl PathExt for Path {
     /// which calls extended-length and device paths unsupported — so handing one back in a message
     /// offers a path mise would not accept.
     ///
-    /// `dunce::simplified` only strips the prefix when the result still names the same file:
-    /// verbatim UNC, device paths, reserved names and paths past `MAX_PATH` keep it, because those
-    /// genuinely do not resolve without it.
+    /// `dunce::simplified` only strips the prefix from `\\?\C:\…` — `Prefix::VerbatimDisk` is the
+    /// one kind its `is_safe_to_strip_unc` accepts, and every other verbatim form comes back
+    /// untouched. Device paths, reserved names and paths past `MAX_PATH` should come back untouched,
+    /// because those genuinely do not resolve without the prefix. A verbatim **UNC** path should
+    /// not: `\\?\UNC\server\share\x` and `\\server\share\x` name the same file, and only the second
+    /// is one mise would accept back — so [`simplify_verbatim_unc`] finishes the job.
     ///
     /// Separators are deliberately left as they are here — see [`settle_display_separators`],
     /// which `file::display_path` applies. This function also feeds strings that are matched
@@ -49,10 +95,11 @@ impl PathExt for Path {
         let path = dunce::simplified(self);
         let home = dirs::HOME.to_string_lossy();
         let home_str: &str = home.as_ref();
-        match cfg!(unix) && path.starts_with(home_str) && home != "/" {
+        let shown = match cfg!(unix) && path.starts_with(home_str) && home != "/" {
             true => path.to_string_lossy().replacen(home_str, "~", 1),
             false => path.to_string_lossy().to_string(),
-        }
+        };
+        simplify_verbatim_unc(shown)
     }
 
     fn mount(&self, on: &Path) -> PathBuf {
@@ -107,7 +154,7 @@ impl PathExt for Path {
 ///   is resolved by bash to the same executable as `/usr/bin`, so no remapping is needed
 ///   for PATH-resolution to succeed.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn windows_path_list_to_unix(path_list: &str, drive_prefix: &str) -> String {
+pub(crate) fn windows_path_list_to_unix(path_list: &str, drive_prefix: &str) -> String {
     let mut out = String::with_capacity(path_list.len());
     let mut first = true;
     for entry in path_list.split(WINDOWS_PATH_SEP) {
@@ -166,7 +213,7 @@ fn append_single_windows_path_to_unix(out: &mut String, entry: &str, drive_prefi
 ///
 /// Returns `None` only when `program` is not valid UTF-8.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn program_stem(program: &Path) -> Option<String> {
+pub(crate) fn program_stem(program: &Path) -> Option<String> {
     let s = program.to_str()?;
     let basename = s.rsplit(['/', '\\']).next().unwrap_or(s);
     let stem = match basename.rsplit_once('.') {
@@ -180,7 +227,7 @@ pub fn program_stem(program: &Path) -> Option<String> {
 /// expects a Unix-style PATH. Used on Windows to decide whether to convert the
 /// child's PATH before spawning.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn is_posix_shell_program(program: &Path) -> bool {
+pub(crate) fn is_posix_shell_program(program: &Path) -> bool {
     const POSIX_SHELLS: &[&str] = &["bash", "sh", "zsh", "fish", "ksh", "dash"];
     let Some(stem) = program_stem(program) else {
         return false;
@@ -195,14 +242,14 @@ pub fn is_posix_shell_program(program: &Path) -> bool {
 /// the `\"` escaping std emits for inner double quotes, so that quoting mangles
 /// commands like `python -c "import x"`. See discussion #9355.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn is_cmd_shell_program(program: &Path) -> bool {
+pub(crate) fn is_cmd_shell_program(program: &Path) -> bool {
     program_stem(program).as_deref() == Some("cmd")
 }
 
 /// Returns true if `program` is PowerShell (`pwsh` / PowerShell Core) or Windows
 /// PowerShell (`powershell`), with or without a directory prefix or `.exe`
 /// extension.
-pub fn is_powershell_program(program: &Path) -> bool {
+pub(crate) fn is_powershell_program(program: &Path) -> bool {
     matches!(
         program_stem(program).as_deref(),
         Some("pwsh" | "powershell")
@@ -227,7 +274,7 @@ pub fn is_powershell_program(program: &Path) -> bool {
 /// abbreviations (`-nop`, `-NoProfile`, `/noprofile`, …). `-NoProfileLoadTime`
 /// is deliberately *not* treated as suppressing the profile — it only affects
 /// startup timing output — so it does not block injection.
-pub fn inject_powershell_no_profile(shell: &mut Vec<String>) {
+pub(crate) fn inject_powershell_no_profile(shell: &mut Vec<String>) {
     let Some(program) = shell.first() else {
         return;
     };
@@ -275,7 +322,11 @@ pub fn inject_powershell_no_profile(shell: &mut Vec<String>) {
 /// the outer pair (cmd passes those inner quotes through untouched) — preserving
 /// the spaces-in-forwarded-args fix from #6744 instead of splitting them.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn cmd_verbatim_args(shell_flags: &[String], script: &str, args: &[String]) -> Vec<String> {
+pub(crate) fn cmd_verbatim_args(
+    shell_flags: &[String],
+    script: &str,
+    args: &[String],
+) -> Vec<String> {
     let mut body = script.to_string();
     for arg in args {
         body.push(' ');
@@ -342,7 +393,7 @@ pub(crate) fn quote_arg_for_cmd_body(arg: &str) -> String {
 /// `TaskExecutor::get_cmd_program_and_args` and the hook path in
 /// `hooks::execute`, extended to the other `cmd /c` call sites. See #9355.
 #[cfg(windows)]
-pub fn cmd_verbatim_command(
+pub(crate) fn cmd_verbatim_command(
     program: &str,
     flags: &[String],
     body: &str,
@@ -376,7 +427,7 @@ pub fn cmd_verbatim_command(
 /// explicit shell path with spaces (when double-quoted) or with backslashes
 /// reaches the spawn verbatim instead of being mangled. Returns `Err` only on
 /// an unbalanced double quote (Windows) or a `shell_words` parse error (Unix).
-pub fn split_shell_command(s: &str) -> eyre::Result<Vec<String>> {
+pub(crate) fn split_shell_command(s: &str) -> eyre::Result<Vec<String>> {
     #[cfg(windows)]
     {
         split_shell_command_windows(s)
@@ -444,7 +495,7 @@ fn split_shell_command_windows(s: &str) -> eyre::Result<Vec<String>> {
 /// `my-cygwinish-tools`) does not trip it. `MSYSTEM` is deliberately not consulted —
 /// PowerShell-launched mise inherits none, so it is not a reliable signal.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn is_cygwin_shell(program: &Path) -> bool {
+pub(crate) fn is_cygwin_shell(program: &Path) -> bool {
     let Some(s) = program.to_str() else {
         return false;
     };
@@ -467,7 +518,7 @@ pub fn is_cygwin_shell(program: &Path) -> bool {
 /// skip such entries; symmetric with the forward converter, which leaves
 /// non-default mount discovery to `MISE_CYGDRIVE_PREFIX` rather than fstab.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn unix_path_to_windows(entry: &str) -> Option<String> {
+pub(crate) fn unix_path_to_windows(entry: &str) -> Option<String> {
     // UNC round-trip: bash represents `\\server\share` as `//server/share`.
     if let Some(rest) = entry.strip_prefix("//")
         && !rest.is_empty()
@@ -536,7 +587,7 @@ pub fn unix_path_to_windows(entry: &str) -> Option<String> {
 /// gate: an explicit override is honored even when the env's PATH is missing
 /// or already Unix-form.
 #[cfg(windows)]
-pub fn resolve_posix_shell_program_path(
+pub(crate) fn resolve_posix_shell_program_path(
     program: &std::ffi::OsStr,
     env: &std::collections::BTreeMap<String, String>,
 ) -> Option<std::ffi::OsString> {
@@ -660,7 +711,7 @@ fn bash_candidates(env: &std::collections::BTreeMap<String, String>) -> Vec<Path
 /// place to run a command that uses mise-managed Windows tools or `C:\...`
 /// script paths.
 #[cfg(windows)]
-pub fn is_wsl_launcher_bash(path: &Path) -> bool {
+pub(crate) fn is_wsl_launcher_bash(path: &Path) -> bool {
     let Some(s) = path.to_str() else {
         return false;
     };
@@ -715,16 +766,49 @@ mod tests {
             Path::new(r"\\server\share\proj").display_user(),
             r"\\server\share\proj"
         );
-        // Verbatim UNC and device paths have no plain equivalent, so they keep the prefix.
+        // A verbatim UNC path does have a plain equivalent, and it is the only form mise accepts
+        // back as input, so the prefix goes. `dunce` leaves this one alone: `is_safe_to_strip_unc`
+        // takes `Prefix::VerbatimDisk` and nothing else.
         assert_eq!(
             Path::new(r"\\?\UNC\server\share").display_user(),
-            r"\\?\UNC\server\share"
+            r"\\server\share"
         );
+        // The shape this was found on, from a project reached through WSL.
+        assert_eq!(
+            Path::new(r"\\?\UNC\wsl.localhost\Ubuntu\home\me\proj").display_user(),
+            r"\\wsl.localhost\Ubuntu\home\me\proj"
+        );
+        // A device path has no plain equivalent and keeps its prefix.
         assert_eq!(Path::new(r"\\.\COM1").display_user(), r"\\.\COM1");
         // A reserved name only resolves through the verbatim form.
         assert_eq!(
             Path::new(r"\\?\C:\proj\CON").display_user(),
             r"\\?\C:\proj\CON"
+        );
+    }
+
+    /// The three shapes where `\\?\UNC\…` has to keep its prefix, because the plain form would not
+    /// name the same file. Each is a way the shorter answer would be wrong rather than merely ugly.
+    #[cfg(windows)]
+    #[test]
+    fn test_display_user_keeps_the_prefix_when_unc_needs_it() {
+        // `/` is an ordinary character inside `\\?\`, so `a/b` is one component here and two in the
+        // plain form. `display_path`'s tests pin the same trap for the disk prefix.
+        assert_eq!(
+            Path::new(r"\\?\UNC\server\share\a/b").display_user(),
+            r"\\?\UNC\server\share\a/b"
+        );
+        // Past MAX_PATH the prefix is what makes the path work.
+        let long = format!(r"\\?\UNC\server\share\{}", "d".repeat(260));
+        assert_eq!(Path::new(&long).display_user(), long);
+        // A trailing dot or space only survives the verbatim form.
+        assert_eq!(
+            Path::new(r"\\?\UNC\server\share\proj.").display_user(),
+            r"\\?\UNC\server\share\proj."
+        );
+        assert_eq!(
+            Path::new(r"\\?\UNC\server\share\proj ").display_user(),
+            r"\\?\UNC\server\share\proj "
         );
     }
 

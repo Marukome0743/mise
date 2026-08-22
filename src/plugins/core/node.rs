@@ -29,7 +29,7 @@ use url::Url;
 use xx::regex;
 
 #[derive(Debug)]
-pub struct NodePlugin {
+pub(super) struct NodePlugin {
     ba: Arc<BackendArg>,
 }
 
@@ -39,7 +39,7 @@ enum FetchOutcome {
 }
 
 impl NodePlugin {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             ba: plugins::core::new_backend_arg("node").into(),
         }
@@ -1284,7 +1284,7 @@ mod tests {
     fn resolve_node_lockfile_options(
         configure_settings: impl FnOnce(&mut SettingsPartial),
     ) -> BTreeMap<String, String> {
-        let lock = TEST_SETTINGS_LOCK.lock().unwrap();
+        let lock = crate::test::lock_ignoring_poison(&TEST_SETTINGS_LOCK);
         let _guard = SettingsResetGuard { _lock: lock };
         let _env_guard = NodeEnvResetGuard::clear();
         let mut settings = SettingsPartial::empty();
@@ -1383,7 +1383,7 @@ mod tests {
 
     #[test]
     fn test_node_flavor_not_found_message_is_flavor_specific() {
-        let lock = TEST_SETTINGS_LOCK.lock().unwrap();
+        let lock = crate::test::lock_ignoring_poison(&TEST_SETTINGS_LOCK);
         let _guard = SettingsResetGuard { _lock: lock };
         let mut settings = SettingsPartial::empty();
         settings.node.flavor = Some("glibc-217".to_string());
@@ -1539,7 +1539,7 @@ mod tests {
 
     #[test]
     fn test_node_lockfile_options_include_legacy_source_build_env() {
-        let lock = TEST_SETTINGS_LOCK.lock().unwrap();
+        let lock = crate::test::lock_ignoring_poison(&TEST_SETTINGS_LOCK);
         let _guard = SettingsResetGuard { _lock: lock };
         let _env_guard = NodeEnvResetGuard::clear();
         env::set_var("NODE_CONFIGURE_OPTS", "--openssl-no-asm");
