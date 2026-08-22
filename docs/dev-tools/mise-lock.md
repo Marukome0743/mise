@@ -233,6 +233,8 @@ mise lock                    # generate URLs for all platforms
 mise lock --platform linux-x64,macos-arm64  # or specific platforms
 ```
 
+The check only covers backends that can record a URL. `asdf`, `cargo`, `gem`, `go`, `npm`, `pipx`, `ubi`, `core:dotnet`, `core:rust`, and `core:swift` install through an external tool or resolve their download at install time, and vfox backend plugins cannot yet report one, so strict mode skips them instead of failing — a config that mixes them with lockable tools still installs. Tools resolved from a [tool stub](/dev-tools/tool-stubs) are skipped as well. See [Backend Support](#backend-support) for what each backend records.
+
 This is useful for CI environments where you want to guarantee reproducible builds without any external API dependencies.
 
 ## Workflow
